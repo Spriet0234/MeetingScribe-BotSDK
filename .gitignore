@@ -1,0 +1,33 @@
+
+# Ignore SDK and binaries
+*.so
+*.tar*
+*.xz
+/qt_libs/
+/lib*/        # lib directories
+/images/
+/json/
+/diagnostic/
+/release_info/
+/h/
+/build/
+/CMakeFiles/
+CMakeCache.txt
+Makefile
+cmake_install.cmake
+zoom_bot
+
+# Ignore OS/editor files
+*.swp
+.DS_Store
+*.log
+
+build/\nqt_libs/\n*.tar*\n*.so\n.env
+libmeetingsdk.so
+libmpg123.so
+libcml.so
+qt_libs/
+h/
+build/
+*.tar.xz
+*.so
