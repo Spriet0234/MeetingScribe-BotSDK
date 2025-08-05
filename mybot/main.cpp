@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 #include <glib.h>
 
+//#include "audio_recorder.h"
 #include "zoom_sdk.h"
 #include "auth_service_interface.h"
 #include "meeting_service_interface.h"
@@ -22,6 +23,8 @@ GMainLoop* authLoop = nullptr;
 static std::string g_meetingId;
 static std::string passcodeGlobal;  // holds command-line passcode
 static std::string zakGlobal;       // holds command-line ZAK token if any
+static IMeetingService* meetingService = nullptr;
+static IAuthService* authService = nullptr;
 
 // ─── Helper: fetch JWT ─────────────────────────────────────────────────────────────
 static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
@@ -63,11 +66,13 @@ public:
                 break;
             case MEETING_STATUS_INMEETING:
                 std::cout << "🎉 Joined meeting!" << std::endl;
+		//startAudioRecording();
                 break;
             case MEETING_STATUS_DISCONNECTING:
             case MEETING_STATUS_FAILED:
                 if (!quitCalled) {
                     std::cout << "🛑 Meeting ended (status=" << status << ") reason=" << result << std::endl;
+		   //stopAudioRecording();
                     if (authLoop) g_main_loop_quit(authLoop);
                     quitCalled = true;
                 }
@@ -93,7 +98,6 @@ void joinMeeting(const std::string& meetingId,
                  const std::string& passcode = "",
                  const std::string& zakToken = "")
 {
-    IMeetingService* meetingService = nullptr;
     if (CreateMeetingService(&meetingService) != SDKERR_SUCCESS || !meetingService) {
         std::cerr << "Failed to create MeetingService" << std::endl;
         return;
@@ -173,8 +177,10 @@ int main(int argc, char* argv[]) {
     }
 
     // Auth
-    IAuthService* authService = nullptr;
-    CreateAuthService(&authService);
+    if ( CreateAuthService(&authService) != SDKERR_SUCCESS || !authService ) {
+        std::cerr << "Failed to create AuthService" << std::endl;
+        return -1;
+    }
     static MyAuthEventHandler authHandler;
     authService->SetEvent(&authHandler);
 

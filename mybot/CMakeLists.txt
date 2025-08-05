@@ -24,10 +24,14 @@ include_directories(
     ${SDK_ROOT}/include
     ${SDK_ROOT}/h
     ${SDK_ROOT}/include/zoom_sdk_components
+    ${SDK_ROOT}/h/rawdata
+
+${CMAKE_CURRENT_SOURCE_DIR}/h
 )
 
 # Source files
-add_executable(zoom_bot main.cpp)
+add_executable(
+zoom_bot main.cpp)
 
 # Link against required libraries
 target_link_libraries(zoom_bot
