@@ -1,0 +1,72 @@
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG APT_MIRROR=http://archive.ubuntu.com/ubuntu/
+ARG SECURITY_MIRROR=http://security.ubuntu.com/ubuntu/
+
+# Core build/runtime deps
+RUN set -eux; \
+    echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80retries; \
+    echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4; \
+    : > /etc/apt/sources.list; \
+    printf 'deb [arch=amd64] %s jammy main restricted universe multiverse\n' "$APT_MIRROR" >> /etc/apt/sources.list; \
+    printf 'deb [arch=amd64] %s jammy-updates main restricted universe multiverse\n' "$APT_MIRROR" >> /etc/apt/sources.list; \
+    printf 'deb [arch=amd64] %s jammy-security main restricted universe multiverse\n' "$SECURITY_MIRROR" >> /etc/apt/sources.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+       ca-certificates \
+       build-essential \
+       cmake \
+       pkg-config \
+       curl \
+       libcurl4-openssl-dev \
+       libglib2.0-dev \
+       libglib2.0-0 \
+       # X11/Qt/OpenGL runtime deps required by Zoom SDK and Qt libs
+       libx11-6 libx11-xcb1 libxcb1 \
+       libxext6 libxrender1 libxi6 libsm6 libxrandr2 libxfixes3 libxcursor1 \
+       libxkbcommon-x11-0 \
+       libxcb-randr0 libxcb-shm0 libxcb-image0 libxcb-keysyms1 libxcb-xfixes0 libxcb-shape0 libxcb-xtest0 \
+       libgbm1 libdrm2 libgl1 \
+       libdbus-1-3 libfontconfig1 libfreetype6 zlib1g libasound2 \
+       pulseaudio \
+       # Dev packages needed to link against GL/DRM/XCB
+       libgl1-mesa-dev libdrm-dev libgbm-dev \
+       libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-image0-dev \
+       libxcb-keysyms1-dev libxcb-xfixes0-dev libxcb-shape0-dev libxcb-xtest0-dev \
+       # Virtual X server for headless GUI (optional)
+       xvfb xauth \
+    && rm -rf /var/lib/apt/lists/*
+
+# Provide nlohmann/json single header instead of apt package
+RUN mkdir -p /usr/include/nlohmann \
+    && curl -fsSL https://raw.githubusercontent.com/nlohmann/json/v3.11.3/single_include/nlohmann/json.hpp \
+    -o /usr/include/nlohmann/json.hpp
+
+WORKDIR /app
+
+# Copy repo (expects Zoom SDK artifacts to be present under MeetingScribe-BotSDK)
+COPY . /app
+
+# Configure Zoom SDK audio backend for raw audio (Pulseaudio)
+RUN mkdir -p /root/.config \
+    && printf "%s\n" "system.audio.type=default" > /root/.config/zoomus.conf
+
+# Build the bot
+# Do not build at image build-time to allow using volume-mounted SDK.
+# Build happens at runtime via entrypoint if needed.
+WORKDIR /app
+
+# Runtime environment for Qt and Zoom SDK libs
+ENV QT_QPA_PLATFORM=offscreen \
+    LD_LIBRARY_PATH=/app/MeetingScribe-BotSDK:/app/MeetingScribe-BotSDK/qt_libs/Qt/lib \
+    QT_PLUGIN_PATH=/app/MeetingScribe-BotSDK/qt_libs/Qt/plugins
+
+WORKDIR /app
+
+# Provide a light wrapper entrypoint to pass meeting params
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["--help"]
