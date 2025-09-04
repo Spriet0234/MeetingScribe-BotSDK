@@ -12,6 +12,18 @@ fi
 
 SDK_ROOT=/app/MeetingScribe-BotSDK
 
+# Ensure HOME is set and Zoom audio config exists for current user
+export HOME="${HOME:-/app}"
+mkdir -p "$HOME/.config"
+if [[ ! -f "$HOME/.config/zoomus.conf" ]]; then
+  echo "system.audio.type=default" > "$HOME/.config/zoomus.conf"
+fi
+
+# Try to launch a user PulseAudio daemon for SDK audio stack
+if command -v pulseaudio >/dev/null 2>&1; then
+  pulseaudio -D --exit-idle-time=-1 >/dev/null 2>&1 || true
+fi
+
 # Optional one-time sync from a packaged SDK folder if explicitly requested.
 if [[ "${SDK_SYNC:-}" == "copy" || "${SDK_SYNC:-}" == "move" ]]; then
   PKG_DIR=$(ls -d "$SDK_ROOT"/zoom-meeting-sdk-linux_* 2>/dev/null | head -n1 || true)
