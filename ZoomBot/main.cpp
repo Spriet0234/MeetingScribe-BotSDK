@@ -1,0 +1,667 @@
+#include <iostream>
+#include <thread>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+#include <glib.h>
+#include <fstream>
+#include <atomic>
+#include <vector>
+
+// Zoom SDK
+#include "zoom_sdk.h"
+#include "auth_service_interface.h"
+#include "meeting_service_interface.h"
+#include "meeting_service_components/meeting_recording_interface.h"
+#include "meeting_service_components/meeting_audio_interface.h"
+
+// Raw data
+#include "rawdata/zoom_rawdata_api.h"
+#include "rawdata/rawdata_audio_helper_interface.h"
+#include "zoom_sdk_raw_data_def.h"
+
+using namespace ZOOMSDK;
+using json = nlohmann::json;
+
+// ─── Globals ─────────────────────────────────────────────────────────────────────
+std::mutex auth_mutex;
+std::condition_variable auth_cv;
+bool auth_done = false;
+GMainLoop *authLoop = nullptr;
+
+static std::string g_meetingId;
+static std::string passcodeGlobal;
+static std::string zakGlobal;
+
+static IMeetingService *meetingService = nullptr;
+static IAuthService *authService = nullptr;
+static IMeetingRecordingController *g_recordController = nullptr;
+static IZoomSDKAudioRawDataHelper *g_audioHelper = nullptr;
+
+static bool g_quiet = false;
+
+static std::atomic<uint64_t> g_mixedFrames{0};
+static std::atomic<bool> g_audioSubscribed{false};
+static std::atomic<bool> g_rawRecording{false};
+
+// ─── Logging ─────────────────────────────────────────────────────────────────────
+static inline void info(const std::string &msg)
+{
+    if (!g_quiet)
+        std::cout << msg << std::endl;
+}
+static inline void error(const std::string &msg)
+{
+    if (!g_quiet)
+        std::cerr << msg << std::endl;
+}
+
+// ─── WAV Writer ──────────────────────────────────────────────────────────────────
+class WavWriter
+{
+public:
+    bool open(const std::string &path, uint32_t sampleRate, uint16_t channels)
+    {
+        close();
+        sample_rate_ = sampleRate;
+        channels_ = channels;
+        ofs_.open(path, std::ios::binary);
+        if (!ofs_)
+            return false;
+        writeHeaderPlaceholder();
+        return true;
+    }
+    void write(const char *data, size_t len)
+    {
+        if (!ofs_)
+            return;
+        ofs_.write(data, static_cast<std::streamsize>(len));
+        data_bytes_ += static_cast<uint32_t>(len);
+    }
+    void close()
+    {
+        if (ofs_)
+            finalizeHeader();
+        if (ofs_.is_open())
+            ofs_.close();
+        data_bytes_ = 0;
+    }
+    ~WavWriter() { close(); }
+
+private:
+    std::ofstream ofs_;
+    uint32_t data_bytes_ = 0;
+    uint32_t sample_rate_ = 32000;
+    uint16_t channels_ = 1;
+
+    void writeHeaderPlaceholder()
+    {
+        uint16_t audio_format = 1, bits_per_sample = 16;
+        uint32_t byte_rate = sample_rate_ * channels_ * bits_per_sample / 8;
+        uint16_t block_align = channels_ * bits_per_sample / 8;
+        ofs_.write("RIFF", 4);
+        writeLE32(0);
+        ofs_.write("WAVE", 4);
+        ofs_.write("fmt ", 4);
+        writeLE32(16);
+        writeLE16(audio_format);
+        writeLE16(channels_);
+        writeLE32(sample_rate_);
+        writeLE32(byte_rate);
+        writeLE16(block_align);
+        writeLE16(bits_per_sample);
+        ofs_.write("data", 4);
+        writeLE32(0);
+    }
+    void finalizeHeader()
+    {
+        if (!ofs_)
+            return;
+        auto cur = ofs_.tellp();
+        ofs_.seekp(40, std::ios::beg);
+        writeLE32(data_bytes_);
+        ofs_.seekp(4, std::ios::beg);
+        writeLE32(36 + data_bytes_);
+        ofs_.seekp(cur, std::ios::beg);
+    }
+    void writeLE16(uint16_t v)
+    {
+        char b[2] = {char(v & 0xFF), char((v >> 8) & 0xFF)};
+        ofs_.write(b, 2);
+    }
+    void writeLE32(uint32_t v)
+    {
+        char b[4] = {char(v & 0xFF), char((v >> 8) & 0xFF), char((v >> 16) & 0xFF), char((v >> 24) & 0xFF)};
+        ofs_.write(b, 4);
+    }
+};
+
+static std::unique_ptr<WavWriter> g_wav;
+
+// ─── Audio Raw Delegate ──────────────────────────────────────────────────────────
+class MyAudioDelegate : public IZoomSDKAudioRawDataDelegate
+{
+public:
+    void onMixedAudioRawDataReceived(AudioRawData *data) override
+    {
+        if (!data || !g_wav)
+            return;
+        auto count = ++g_mixedFrames;
+        if ((count % 50) == 0 && !g_quiet)
+        {
+            std::cout << "[audio] mixed frames received: " << count
+                      << " (last chunk bytes=" << data->GetBufferLen() << ")\n";
+        }
+        g_wav->write(data->GetBuffer(), data->GetBufferLen());
+    }
+    void onOneWayAudioRawDataReceived(AudioRawData *, uint32_t) override {}
+    void onShareAudioRawDataReceived(AudioRawData *, uint32_t) override {}
+    void onOneWayInterpreterAudioRawDataReceived(AudioRawData *, const zchar_t *) override {}
+};
+
+static std::unique_ptr<MyAudioDelegate> g_audioDelegate;
+
+class MyAudioCtrlEvent : public IMeetingAudioCtrlEvent
+{
+public:
+    void onUserAudioStatusChange(IList<IUserAudioStatus *> *lst, const zchar_t *) override
+    {
+        if (!lst)
+            return;
+        for (int i = 0; i < lst->GetCount(); ++i)
+        {
+            auto *s = lst->GetItem(i);
+            if (!s)
+                continue;
+            info("Audio status: uid=" + std::to_string(s->GetUserId()) +
+                 ", type=" + std::to_string((int)s->GetAudioType()) +
+                 ", status=" + std::to_string((int)s->GetStatus()));
+        }
+    }
+    void onUserActiveAudioChange(IList<unsigned int> *lst) override
+    {
+        if (!lst)
+            return;
+        std::string uids;
+        for (int i = 0; i < lst->GetCount(); ++i)
+        {
+            if (i)
+                uids += ',';
+            uids += std::to_string(lst->GetItem(i));
+        }
+        info("Active audio: " + uids);
+    }
+    void onHostRequestStartAudio(IRequestStartAudioHandler *) override {}
+    void onJoin3rdPartyTelephonyAudio(const zchar_t *) override {}
+    void onMuteOnEntryStatusChange(bool) override {}
+};
+
+static std::unique_ptr<MyAudioCtrlEvent> g_audioCtrlEvent;
+
+// ─── JWT helper ──────────────────────────────────────────────────────────────────
+static size_t WriteCallback(void *c, size_t s, size_t n, void *u)
+{
+    auto *str = static_cast<std::string *>(u);
+    str->append(static_cast<char *>(c), s * n);
+    return s * n;
+}
+std::string fetchJwtToken()
+{
+    CURL *curl = curl_easy_init();
+    std::string resp;
+    if (curl)
+    {
+        curl_easy_setopt(curl, CURLOPT_URL, "https://meeting-scribe-backend.vercel.app/api/jwt");
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+        CURLcode res = curl_easy_perform(curl);
+        if (res != CURLE_OK)
+            std::cerr << "curl error: " << curl_easy_strerror(res) << std::endl;
+        curl_easy_cleanup(curl);
+    }
+    try
+    {
+        return json::parse(resp).at("token").get<std::string>();
+    }
+    catch (...)
+    {
+        std::cerr << "Failed to parse JWT response.\n";
+        return "";
+    }
+}
+
+static void try_start_raw_pipeline()
+{
+    if (!meetingService)
+        return;
+
+    auto rec = meetingService->GetMeetingRecordingController();
+    if (!rec)
+    {
+        error("No MeetingRecordingController");
+        return;
+    }
+
+    SDKError r = rec->StartRawRecording();
+    if (r == SDKERR_SUCCESS)
+    {
+        g_rawRecording = true;
+        info("Raw recording started");
+    }
+    else if (r == SDKERR_NO_PERMISSION)
+    {
+        error("StartRawRecording: NO_PERMISSION (wait for host to grant local recording)");
+        return;
+    }
+    else
+    {
+        error(std::string("StartRawRecording failed: ") + std::to_string(r));
+        return;
+    }
+
+    g_audioHelper = GetAudioRawdataHelper();
+    if (!g_audioHelper)
+    {
+        error("GetAudioRawdataHelper() returned null");
+        return;
+    }
+
+    if (!g_audioDelegate)
+        g_audioDelegate = std::make_unique<MyAudioDelegate>();
+    if (!g_wav)
+        g_wav = std::make_unique<WavWriter>();
+
+    if (!g_wav->open("recording.wav", 32000, 1))
+    {
+        error("Failed to open recording.wav");
+        return;
+    }
+
+    SDKError s = g_audioHelper->subscribe(g_audioDelegate.get());
+    if (s == SDKERR_SUCCESS)
+    {
+        g_audioSubscribed = true;
+        info("Subscribed to mixed audio raw data");
+    }
+    else
+    {
+        error(std::string("Audio subscribe failed: ") + std::to_string(s));
+    }
+}
+
+struct MyRecordingCtrlEvent : public IMeetingRecordingCtrlEvent
+{
+    void onRecordingStatus(RecordingStatus status) override
+    {
+        info(std::string("[rec] local recording status=") + std::to_string((int)status));
+    }
+    void onCloudRecordingStatus(RecordingStatus status) override
+    {
+        info(std::string("[rec] cloud recording status=") + std::to_string((int)status));
+    }
+    void onRecordPrivilegeChanged(bool bCanRec) override
+    {
+        info(std::string("[rec] record privilege changed: ") + (bCanRec ? "granted" : "revoked"));
+        if (bCanRec && !g_rawRecording.load())
+            try_start_raw_pipeline();
+    }
+    void onLocalRecordingPrivilegeRequestStatus(RequestLocalRecordingStatus st) override
+    {
+        info(std::string("[rec] local rec privilege request status=") + std::to_string((int)st));
+    }
+    void onRequestCloudRecordingResponse(RequestStartCloudRecordingStatus st) override
+    {
+        info(std::string("[rec] request cloud recording response=") + std::to_string((int)st));
+    }
+    void onLocalRecordingPrivilegeRequested(IRequestLocalRecordingPrivilegeHandler *) override
+    {
+        info("[rec] local recording privilege requested (host-side)");
+    }
+    void onStartCloudRecordingRequested(IRequestStartCloudRecordingHandler *) override
+    {
+        info("[rec] start cloud recording requested (host-side)");
+    }
+    void onCloudRecordingStorageFull(time_t) override { error("[rec] cloud recording storage full"); }
+#if defined(WIN32)
+    void onRecording2MP4Done(bool, int, const zchar_t *) override {}
+    void onRecording2MP4Processing(int) override {}
+    void onCustomizedLocalRecordingSourceNotification(void *) override {}
+#endif
+    void onEnableAndStartSmartRecordingRequested(IRequestEnableAndStartSmartRecordingHandler *) override
+    {
+        info("[rec] smart recording enable/start requested");
+    }
+    void onSmartRecordingEnableActionCallback(ISmartRecordingEnableActionHandler *) override
+    {
+        info("[rec] smart recording enable action callback");
+    }
+#if defined(__linux__)
+    void onTranscodingStatusChanged(TranscodingStatus st, const zchar_t *path) override
+    {
+        info(std::string("[rec] transcoding status=") + std::to_string((int)st) + (path ? " (path set)" : " (path null)"));
+    }
+#endif
+};
+static std::unique_ptr<MyRecordingCtrlEvent> g_recordEvt;
+
+// ─── Meeting events ──────────────────────────────────────────────────────────────
+class MyMeetingEventHandler : public IMeetingServiceEvent
+{
+public:
+    MyMeetingEventHandler() : quitCalled(false) {}
+    void onMeetingStatusChanged(MeetingStatus status, int result) override
+    {
+        auto rec = meetingService->GetMeetingRecordingController();
+        if (rec)
+        {
+            if (!g_recordEvt)
+                g_recordEvt = std::make_unique<MyRecordingCtrlEvent>();
+            rec->SetEvent(g_recordEvt.get());
+        }
+
+        auto fail_code_to_str = [](int code) -> const char *
+        {
+            switch (code)
+            {
+            case 1:
+                return "MEETING_FAIL_CONNECTION_ERR";
+            case 2:
+                return "MEETING_FAIL_RECONNECT_ERR";
+            case 3:
+                return "MEETING_FAIL_MMR_ERR";
+            case 4:
+                return "MEETING_FAIL_PASSWORD_ERR";
+            case 6:
+                return "MEETING_FAIL_MEETING_OVER";
+            case 7:
+                return "MEETING_FAIL_MEETING_NOT_START";
+            case 8:
+                return "MEETING_FAIL_MEETING_NOT_EXIST";
+            case 9:
+                return "MEETING_FAIL_MEETING_USER_FULL";
+            case 10:
+                return "MEETING_FAIL_CLIENT_INCOMPATIBLE";
+            case 12:
+                return "MEETING_FAIL_CONFLOCKED";
+            case 13:
+                return "MEETING_FAIL_MEETING_RESTRICTED";
+            case 14:
+                return "MEETING_FAIL_MEETING_RESTRICTED_JBH";
+            case 15:
+                return "MEETING_FAIL_CANNOT_EMIT_WEBREQUEST";
+            case 16:
+                return "MEETING_FAIL_CANNOT_START_TOKENEXPIRE";
+            case 27:
+                return "CONF_FAIL_VANITY_NOT_EXIST";
+            case 29:
+                return "CONF_FAIL_DISALLOW_HOST_MEETING";
+            case 50:
+                return "MEETING_FAIL_WRITE_CONFIG_FILE";
+            case 60:
+                return "MEETING_FAIL_FORBID_TO_JOIN_INTERNAL_MEETING";
+            case 61:
+                return "CONF_FAIL_REMOVED_BY_HOST";
+            case 62:
+                return "MEETING_FAIL_HOST_DISALLOW_OUTSIDE_USER_JOIN";
+            case 63:
+                return "MEETING_FAIL_UNABLE_TO_JOIN_EXTERNAL_MEETING";
+            case 64:
+                return "MEETING_FAIL_BLOCKED_BY_ACCOUNT_ADMIN";
+            case 82:
+                return "MEETING_FAIL_NEED_SIGN_IN_FOR_PRIVATE_MEETING";
+            case 500:
+                return "MEETING_FAIL_APP_PRIVILEGE_TOKEN_ERROR";
+            default:
+                return "UNKNOWN_FAIL_CODE";
+            }
+        };
+        auto print_status = [&](const char *label)
+        {
+            if (!g_quiet)
+                std::cout << label << " (status=" << status << ", code=" << result << ")\n";
+        };
+
+        switch (status)
+        {
+        case MEETING_STATUS_CONNECTING:
+            print_status("Connecting to meeting...");
+            break;
+        case MEETING_STATUS_WAITINGFORHOST:
+            print_status("Waiting for host to start");
+            break;
+        case MEETING_STATUS_IN_WAITING_ROOM:
+            print_status("In waiting room");
+            break;
+        case MEETING_STATUS_RECONNECTING:
+            print_status("Reconnecting");
+            break;
+
+        case MEETING_STATUS_INMEETING:
+            info("Joined meeting");
+            if (meetingService)
+            {
+                if (auto audioCtrl = meetingService->GetMeetingAudioController())
+                {
+                    if (!g_audioCtrlEvent)
+                        g_audioCtrlEvent = std::make_unique<MyAudioCtrlEvent>();
+                    audioCtrl->SetEvent(g_audioCtrlEvent.get());
+                    audioCtrl->EnablePlayMeetingAudio(true);
+                    if (SDKError aerr = audioCtrl->JoinVoip(); aerr != SDKERR_SUCCESS)
+                        error("JoinVoip failed: " + std::to_string(aerr));
+                }
+
+                g_recordController = meetingService->GetMeetingRecordingController();
+                if (g_recordController)
+                {
+                    if (!g_recordEvt)
+                        g_recordEvt = std::make_unique<MyRecordingCtrlEvent>();
+                    g_recordController->SetEvent(g_recordEvt.get());
+                    SDKError req = g_recordController->RequestLocalRecordingPrivilege();
+                    if (req != SDKERR_SUCCESS)
+                        error("RequestLocalRecordingPrivilege failed: " + std::to_string(req));
+                }
+
+                // Get helper now (subscription happens after StartRawRecording succeeds)
+                g_audioHelper = GetAudioRawdataHelper();
+                if (!g_audioHelper)
+                    error("GetAudioRawdataHelper() returned null");
+            }
+            break;
+
+        case MEETING_STATUS_FAILED:
+            if (!quitCalled)
+            {
+                error(std::string("Meeting failed: ") + fail_code_to_str(result) + " (code=" + std::to_string(result) + ")");
+                if (auto last = GetZoomLastError())
+                {
+                    error(std::string("LastError: type=") + std::to_string((int)last->GetErrorType()) +
+                          ", code=" + std::to_string((unsigned long long)last->GetErrorCode()) +
+                          ", desc=" + (last->GetErrorDescription() ? last->GetErrorDescription() : ""));
+                }
+                stopRecordingAndCleanup();
+                if (authLoop)
+                    g_main_loop_quit(authLoop);
+                quitCalled = true;
+            }
+            break;
+
+        case MEETING_STATUS_DISCONNECTING:
+        case MEETING_STATUS_ENDED:
+            stopRecordingAndCleanup();
+            if (authLoop)
+                g_main_loop_quit(authLoop);
+            break;
+
+        default:
+            print_status("ℹ️ Status change");
+            break;
+        }
+    }
+
+    void onMeetingStatisticsWarningNotification(StatisticsWarningType) override {}
+    void onMeetingParameterNotification(const MeetingParameter *) override {}
+    void onSuspendParticipantsActivities() override {}
+    void onAICompanionActiveChangeNotice(bool) override {}
+    void onMeetingTopicChanged(const zchar_t *) override {}
+    void onMeetingFullToWatchLiveStream(const zchar_t *) override {}
+
+private:
+    void stopRecordingAndCleanup()
+    {
+        if (g_audioHelper && g_audioSubscribed.load())
+        {
+            g_audioHelper->unSubscribe();
+            g_audioSubscribed = false;
+        }
+        if (g_recordController && g_rawRecording.load())
+        {
+            g_recordController->StopRawRecording();
+            g_rawRecording = false;
+        }
+        if (g_wav)
+        {
+            g_wav->close();
+            info("Saved recording to recording.wav");
+        }
+    }
+    bool quitCalled;
+};
+static MyMeetingEventHandler meetingHandler;
+
+// ─── Join helper ─────────────────────────────────────────────────────────────────
+void joinMeeting(const std::string &meetingId, const std::string &userName,
+                 const std::string &passcode = "", const std::string &zakToken = "")
+{
+    if (CreateMeetingService(&meetingService) != SDKERR_SUCCESS || !meetingService)
+    {
+        std::cerr << "Failed to create MeetingService\n";
+        return;
+    }
+    meetingService->SetEvent(&meetingHandler);
+
+    JoinParam jp;
+    jp.userType = SDK_UT_WITHOUT_LOGIN;
+    auto &p = jp.param.withoutloginuserJoin;
+    p.meetingNumber = std::stoull(meetingId);
+    p.vanityID = nullptr;
+    p.userName = userName.c_str();
+    p.psw = passcode.c_str();
+    p.app_privilege_token = nullptr;
+    p.userZAK = zakToken.empty() ? nullptr : zakToken.c_str();
+    p.customer_key = nullptr;
+    p.webinarToken = nullptr;
+    p.isVideoOff = true;
+    p.isAudioOff = true;
+    p.join_token = nullptr;
+    p.onBehalfToken = nullptr;
+    p.isMyVoiceInMix = false;
+    p.isAudioRawDataStereo = false;
+    p.eAudioRawdataSamplingRate = AudioRawdataSamplingRate_32K;
+
+    SDKError err = meetingService->Join(jp);
+    if (err != SDKERR_SUCCESS)
+        std::cerr << "Join failed: " << err << std::endl;
+}
+
+// ─── Auth events ─────────────────────────────────────────────────────────────────
+class MyAuthEventHandler : public IAuthServiceEvent
+{
+public:
+    void onAuthenticationReturn(AuthResult result) override
+    {
+        if (result == AUTHRET_SUCCESS)
+        {
+            std::cout << "✅ Auth success – joining " << g_meetingId << std::endl;
+            joinMeeting(g_meetingId, "MyBot", passcodeGlobal, zakGlobal);
+        }
+        else
+        {
+            std::cerr << "❌ Auth failed: " << result << std::endl;
+            if (authLoop)
+                g_main_loop_quit(authLoop);
+        }
+    }
+    void onLogout() override {}
+    void onZoomIdentityExpired() override {}
+    void onZoomAuthIdentityExpired() override {}
+    void onLoginReturnWithReason(LOGINSTATUS, IAccountInfo *, LoginFailReason) override {}
+};
+
+// ─── main ────────────────────────────────────────────────────────────────────────
+int main(int argc, char *argv[])
+{
+    std::vector<std::string> positional;
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string a = argv[i];
+        if (a == "--quiet" || a == "-q")
+        {
+            g_quiet = true;
+            continue;
+        }
+        positional.push_back(a);
+    }
+    if (positional.size() < 1)
+    {
+        std::cerr << "Usage: zoom_bot [--quiet|-q] <meetingNumber> [passcode] [zakToken]\n";
+        return 1;
+    }
+    g_meetingId = positional[0];
+    if (positional.size() >= 2)
+        passcodeGlobal = positional[1];
+    if (positional.size() >= 3)
+        zakGlobal = positional[2];
+
+    auto jwtToken = fetchJwtToken();
+    if (jwtToken.empty())
+    {
+        std::cerr << "Failed to fetch JWT\n";
+        return -1;
+    }
+    info("Fetched JWT");
+
+    InitParam ip;
+    ip.strWebDomain = "https://zoom.us";
+    ip.strSupportUrl = "https://zoom.us";
+    ip.emLanguageID = LANGUAGE_English;
+    ip.enableLogByDefault = true;
+    ip.enableGenerateDump = true;
+    ip.rawdataOpts.audioRawdataMemoryMode = ZoomSDKRawDataMemoryModeHeap;
+    ip.rawdataOpts.videoRawdataMemoryMode = ZoomSDKRawDataMemoryModeHeap;
+    ip.rawdataOpts.shareRawdataMemoryMode = ZoomSDKRawDataMemoryModeHeap;
+    if (InitSDK(ip) != SDKERR_SUCCESS)
+    {
+        std::cerr << "SDK init failed\n";
+        return -1;
+    }
+
+    if (!HasRawdataLicense())
+        error("Raw data license not detected. Audio callbacks may not fire.");
+    else
+        info("Raw data license detected");
+
+    if (CreateAuthService(&authService) != SDKERR_SUCCESS || !authService)
+    {
+        std::cerr << "Failed to create AuthService\n";
+        return -1;
+    }
+    static MyAuthEventHandler authHandler;
+    authService->SetEvent(&authHandler);
+
+    AuthContext ac;
+    ac.jwt_token = jwtToken.c_str();
+    if (authService->SDKAuth(ac) != SDKERR_SUCCESS)
+    {
+        std::cerr << "SDKAuth failed\n";
+        return -1;
+    }
+
+    authLoop = g_main_loop_new(nullptr, FALSE);
+    g_main_loop_run(authLoop);
+    g_main_loop_unref(authLoop);
+
+    CleanUPSDK();
+    return 0;
+}
