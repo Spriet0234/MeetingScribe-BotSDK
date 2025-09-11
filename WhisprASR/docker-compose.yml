@@ -1,0 +1,21 @@
+services:
+  asr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: whispr-asr:cpu  
+    environment:
+      MODEL: small.en
+      DEVICE: cpu
+      COMPUTE: int8
+      PORT: "8080"
+    expose: ["8080"]
+    restart: unless-stopped
+
+  asr-lb:
+    image: haproxy:lts
+    depends_on: [asr]
+    ports: ["8080:8080"]
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    restart: unless-stopped
