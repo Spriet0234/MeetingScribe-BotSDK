@@ -22,6 +22,7 @@ RUN set -eux; \
     libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-image0-dev \
     libxcb-keysyms1-dev libxcb-xfixes0-dev libxcb-shape0-dev libxcb-xtest0-dev \
     xvfb xauth \
+    nodejs npm \
     ; rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /usr/include/nlohmann \
@@ -41,6 +42,12 @@ ENV QT_QPA_PLATFORM=offscreen \
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+
+#For node
+RUN cd /app/ZoomBot && npm init -y && npm install ws --omit=dev
+RUN ln -s /usr/bin/nodejs /usr/local/bin/node
+
+
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["--help"]

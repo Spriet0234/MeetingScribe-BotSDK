@@ -53,13 +53,11 @@ if [[ "${SDK_SYNC:-}" == "copy" || "${SDK_SYNC:-}" == "move" ]]; then
     [[ "$SDK_SYNC" == "move" ]] && mv -f "$PKG_DIR/h" "$SDK_DIR/" || cp -a "$PKG_DIR/h" "$SDK_DIR/"
   fi
 
-  # qt libs/plugins
   if [[ -d "$PKG_DIR/qt_libs" ]]; then
     rm -rf "$SDK_DIR/qt_libs"
     [[ "$SDK_SYNC" == "move" ]] && mv -f "$PKG_DIR/qt_libs" "$SDK_DIR/" || cp -a "$PKG_DIR/qt_libs" "$SDK_DIR/"
   fi
 
-  # core .so files
   for lib in libmeetingsdk.so libmpg123.so libcml.so; do
     if [[ -f "$PKG_DIR/$lib" ]]; then
       [[ "$SDK_SYNC" == "move" ]] && mv -f "$PKG_DIR/$lib" "$SDK_DIR/lib/" || cp -a "$PKG_DIR/$lib" "$SDK_DIR/lib/"
@@ -109,6 +107,17 @@ if [[ $# -eq 0 ]]; then
   fi
   set -- "${MEETING_NUMBER}" "${MEETING_PASSCODE:-}" "${MEETING_ZAK:-}"
 fi
+
+NODE_BIN="$(command -v node || command -v nodejs || true)"
+if [[ -z "$NODE_BIN" ]]; then
+  echo "ERROR: node not found in PATH" >&2
+  exit 2
+fi
+
+echo "[entrypoint] starting ASR bridge with $NODE_BIN at /app/ZoomBot/asr_stream_client.js"
+ASR_WS_URL="${ASR_WS_URL:-ws://host.docker.internal:8080/ws}" \
+BOT_PCM_PORT="${BOT_PCM_PORT:-7000}" \
+"$NODE_BIN" /app/ZoomBot/asr_stream_client.js &
 
 if [[ "${USE_XVFB:-}" == "1" ]]; then
   echo "Starting under Xvfb (headless X11)."

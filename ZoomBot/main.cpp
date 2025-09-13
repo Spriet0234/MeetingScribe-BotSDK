@@ -22,6 +22,11 @@
 #include "rawdata/rawdata_audio_helper_interface.h"
 #include "zoom_sdk_raw_data_def.h"
 
+// socket
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
 using namespace ZOOMSDK;
 using json = nlohmann::json;
 
@@ -45,6 +50,8 @@ static bool g_quiet = false;
 static std::atomic<uint64_t> g_mixedFrames{0};
 static std::atomic<bool> g_audioSubscribed{false};
 static std::atomic<bool> g_rawRecording{false};
+
+static int g_pcm_sock = -1;
 
 // ─── Logging ─────────────────────────────────────────────────────────────────────
 static inline void info(const std::string &msg)
@@ -140,22 +147,48 @@ private:
 
 static std::unique_ptr<WavWriter> g_wav;
 
+static void open_pcm_socket_once()
+{
+    if (g_pcm_sock != -1)
+        return;
+    g_pcm_sock = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(7000); // BOT_PCM_PORT
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (connect(g_pcm_sock, (sockaddr *)&addr, sizeof(addr)) != 0)
+    {
+        perror("connect 127.0.0.1:7000");
+        g_pcm_sock = -1;
+    }
+}
+
 // ─── Audio Raw Delegate ──────────────────────────────────────────────────────────
 class MyAudioDelegate : public IZoomSDKAudioRawDataDelegate
 {
 public:
     void onMixedAudioRawDataReceived(AudioRawData *data) override
     {
-        if (!data || !g_wav)
+        if (!data)
             return;
+
+        open_pcm_socket_once();
+        if (g_pcm_sock != -1)
+        {
+            send(g_pcm_sock, data->GetBuffer(), data->GetBufferLen(), MSG_NOSIGNAL);
+        }
+
+        if (g_wav)
+            g_wav->write(data->GetBuffer(), data->GetBufferLen());
+
         auto count = ++g_mixedFrames;
         if ((count % 50) == 0 && !g_quiet)
         {
             std::cout << "[audio] mixed frames received: " << count
                       << " (last chunk bytes=" << data->GetBufferLen() << ")\n";
         }
-        g_wav->write(data->GetBuffer(), data->GetBufferLen());
     }
+
     void onOneWayAudioRawDataReceived(AudioRawData *, uint32_t) override {}
     void onShareAudioRawDataReceived(AudioRawData *, uint32_t) override {}
     void onOneWayInterpreterAudioRawDataReceived(AudioRawData *, const zchar_t *) override {}
@@ -346,6 +379,15 @@ struct MyRecordingCtrlEvent : public IMeetingRecordingCtrlEvent
 };
 static std::unique_ptr<MyRecordingCtrlEvent> g_recordEvt;
 
+static void close_pcm_socket()
+{
+    if (g_pcm_sock != -1)
+    {
+        close(g_pcm_sock);
+        g_pcm_sock = -1;
+    }
+}
+
 // ─── Meeting events ──────────────────────────────────────────────────────────────
 class MyMeetingEventHandler : public IMeetingServiceEvent
 {
@@ -520,14 +562,18 @@ private:
             g_recordController->StopRawRecording();
             g_rawRecording = false;
         }
+        close_pcm_socket();
+
         if (g_wav)
         {
             g_wav->close();
             info("Saved recording to recording.wav");
         }
     }
+
     bool quitCalled;
 };
+
 static MyMeetingEventHandler meetingHandler;
 
 // ─── Join helper ─────────────────────────────────────────────────────────────────
