@@ -16,6 +16,7 @@
 #include "meeting_service_interface.h"
 #include "meeting_service_components/meeting_recording_interface.h"
 #include "meeting_service_components/meeting_audio_interface.h"
+#include "meeting_service_components/meeting_participants_ctrl_interface.h"
 
 // Raw data
 #include "rawdata/zoom_rawdata_api.h"
@@ -53,7 +54,19 @@ static std::atomic<bool> g_rawRecording{false};
 
 static int g_pcm_sock = -1;
 
-// ─── Logging ─────────────────────────────────────────────────────────────────────
+static void send_udp_line(uint16_t port, const std::string &line)
+{
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0)
+        return;
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+    sendto(s, line.data(), (int)line.size(), 0, (sockaddr *)&a, sizeof(a));
+    close(s);
+}
+
 static inline void info(const std::string &msg)
 {
     if (!g_quiet)
@@ -65,7 +78,6 @@ static inline void error(const std::string &msg)
         std::cerr << msg << std::endl;
 }
 
-// ─── WAV Writer ──────────────────────────────────────────────────────────────────
 class WavWriter
 {
 public:
@@ -163,7 +175,6 @@ static void open_pcm_socket_once()
     }
 }
 
-// ─── Audio Raw Delegate ──────────────────────────────────────────────────────────
 class MyAudioDelegate : public IZoomSDKAudioRawDataDelegate
 {
 public:
@@ -226,6 +237,7 @@ public:
         }
         info("Active audio: " + uids);
     }
+
     void onHostRequestStartAudio(IRequestStartAudioHandler *) override {}
     void onJoin3rdPartyTelephonyAudio(const zchar_t *) override {}
     void onMuteOnEntryStatusChange(bool) override {}
@@ -388,7 +400,30 @@ static void close_pcm_socket()
     }
 }
 
-// ─── Meeting events ──────────────────────────────────────────────────────────────
+static void emit_roster_names(IMeetingService *ms)
+{
+    if (!ms)
+        return;
+    auto pc = ms->GetMeetingParticipantsController();
+    if (!pc)
+        return;
+    auto lst = pc->GetParticipantsList();
+    if (!lst)
+        return;
+
+    std::string line = "map=";
+    for (int i = 0; i < lst->GetCount(); ++i)
+    {
+        auto uid = lst->GetItem(i);
+        auto info = pc->GetUserByUserID(uid);
+        const char *nm = (info && info->GetUserName()) ? info->GetUserName() : "User";
+        if (i)
+            line += '|';
+        line += std::to_string(uid) + ":" + std::string(nm);
+    }
+    send_udp_line(7101, line);
+}
+
 class MyMeetingEventHandler : public IMeetingServiceEvent
 {
 public:
@@ -508,7 +543,26 @@ public:
                 // Get helper now (subscription happens after StartRawRecording succeeds)
                 g_audioHelper = GetAudioRawdataHelper();
                 if (!g_audioHelper)
+                {
                     error("GetAudioRawdataHelper() returned null");
+                }
+
+                // Initial roster + periodic refresh
+                emit_roster_names(meetingService);
+
+                static std::atomic<bool> roster_refresh_running{false};
+                if (!roster_refresh_running.exchange(true))
+                {
+                    std::thread([&roster_refresh_running]()
+                                {
+                while (true) {
+                    std::this_thread::sleep_for(std::chrono::seconds(10));
+                    if (!meetingService) break;              // stop after meeting ends
+                    emit_roster_names(meetingService);
+                }
+                roster_refresh_running = false; })
+                        .detach();
+                }
             }
             break;
 

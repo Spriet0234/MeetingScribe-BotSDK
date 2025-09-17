@@ -1,4 +1,3 @@
-// frames 20ms and streams to ASR over WebSocket.
 const net = require("net");
 const WebSocket = require("ws");
 
@@ -6,8 +5,44 @@ const TCP_PORT = process.env.BOT_PCM_PORT || 7000;
 const ASR_URL = process.env.ASR_WS_URL || "ws://asr-lb:8080/ws";
 const AUTH_TOKEN = process.env.ASR_TOKEN || "";
 
-const FRAME = 640; // bytes 16k, 20ms
+const FRAME = 640;
 let ws;
+
+const dgram = require("dgram");
+
+const activeSock = dgram.createSocket("udp4");
+let currentActive = { ids: [], since: Date.now() };
+
+activeSock.on("message", (msg) => {
+  const m = msg.toString();
+  if (m.startsWith("active=")) {
+    const ids = m.slice(7).split(",").filter(Boolean);
+    currentActive = { ids, since: Date.now() };
+  }
+});
+activeSock.bind(7100, "127.0.0.1");
+
+const nameSock = dgram.createSocket("udp4");
+const nameMap = new Map();
+
+nameSock.on("message", (msg) => {
+  const m = msg.toString();
+  if (m.startsWith("map=")) {
+    const items = m.slice(4).split("|");
+    for (const it of items) {
+      const [uid, name] = it.split(":");
+      if (uid) nameMap.set(uid, name || "User");
+    }
+  }
+});
+nameSock.bind(7101, "127.0.0.1");
+
+// Helper: label to print now
+function currentSpeakerLabel() {
+  const uid = currentActive.ids[0] || "";
+  const name = uid ? nameMap.get(uid) || `User ${uid}` : "Unknown";
+  return { uid, name };
+}
 
 function downsample32kTo16k(buf32k) {
   const samp = new Int16Array(
@@ -64,7 +99,19 @@ async function connectASR() {
 
   ws.on("message", (m) => {
     try {
-      console.log("[ASR]", m.toString());
-    } catch {}
+      const data = JSON.parse(m);
+      if (data.type === "partial") {
+        const { name } = currentSpeakerLabel();
+        console.log(`[partial][${name}] ${data.text}`);
+      } else if (data.type === "final") {
+        const { name } = currentSpeakerLabel();
+        console.log(`[final][${name}] ${data.text}`);
+        // TODO: append to a file/DB if you want persistence
+      } else {
+        console.log("[ASR]", data);
+      }
+    } catch {
+      console.log("[ASR raw]", m.toString());
+    }
   });
 })();
