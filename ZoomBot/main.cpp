@@ -28,6 +28,11 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
+#include <codecvt>
+#include <locale>
+#include <unordered_map>
+#include <string>
+
 using namespace ZOOMSDK;
 using json = nlohmann::json;
 
@@ -52,7 +57,39 @@ static std::atomic<uint64_t> g_mixedFrames{0};
 static std::atomic<bool> g_audioSubscribed{false};
 static std::atomic<bool> g_rawRecording{false};
 
+static std::atomic<bool> g_roster_refresh_running{false};
+
+static std::unordered_map<unsigned int, std::string> g_uid_to_name;
+
 static int g_pcm_sock = -1;
+
+static std::string zchar_to_utf8(const zchar_t *z)
+{
+    if (!z)
+        return "[unknown]";
+
+#if defined(_WIN32) || defined(_WIN64)
+    try
+    {
+        std::wstring ws(reinterpret_cast<const wchar_t *>(z));
+        static std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
+        return conv.to_bytes(ws);
+    }
+    catch (...)
+    {
+        return "[invalid-name]";
+    }
+#else
+    try
+    {
+        return std::string(reinterpret_cast<const char *>(z));
+    }
+    catch (...)
+    {
+        return "[invalid-name]";
+    }
+#endif
+}
 
 static void send_udp_line(uint16_t port, const std::string &line)
 {
@@ -175,6 +212,68 @@ static void open_pcm_socket_once()
     }
 }
 
+static void emit_roster_names(IMeetingService *ms)
+{
+    if (!ms)
+        return;
+
+    auto pc = ms->GetMeetingParticipantsController();
+    if (!pc)
+    {
+        info("[roster] participants controller is null");
+        return;
+    }
+
+    auto lst = pc->GetParticipantsList();
+    if (!lst)
+    {
+        info("[roster] participant list is null");
+        return;
+    }
+
+    for (int i = 0; i < lst->GetCount(); ++i)
+    {
+        unsigned int uid = lst->GetItem(i);
+        auto infoI = pc->GetUserByUserID(uid);
+        std::string name = "[unknown]";
+        if (infoI)
+        {
+            const zchar_t *zname = infoI->GetUserName();
+            auto n = zchar_to_utf8(zname);
+            if (!n.empty())
+                name = n;
+        }
+        g_uid_to_name[uid] = name;
+    }
+
+    std::string line = "[roster] ";
+    for (const auto &kv : g_uid_to_name)
+        line += std::to_string(kv.first) + ":" + kv.second + "  ";
+    info(line);
+
+    auto sanitize = [](std::string s)
+    {
+        for (char &c : s)
+        {
+            if (c == '|' || c == ':' || c == '\n' || c == '\r')
+                c = ' ';
+        }
+        return s;
+    };
+
+    std::string wire = "map=";
+    bool first = true;
+    for (const auto &kv : g_uid_to_name)
+    {
+        if (!first)
+            wire += '|';
+        first = false;
+        wire += std::to_string(kv.first) + ":" + sanitize(kv.second);
+    }
+
+    send_udp_line(7101, wire);
+}
+
 class MyAudioDelegate : public IZoomSDKAudioRawDataDelegate
 {
 public:
@@ -193,11 +292,11 @@ public:
             g_wav->write(data->GetBuffer(), data->GetBufferLen());
 
         auto count = ++g_mixedFrames;
-        if ((count % 50) == 0 && !g_quiet)
-        {
-            std::cout << "[audio] mixed frames received: " << count
-                      << " (last chunk bytes=" << data->GetBufferLen() << ")\n";
-        }
+        // if ((count % 50) == 0 && !g_quiet)
+        // {
+        //     std::cout << "[audio] mixed frames received: " << count
+        //               << " (last chunk bytes=" << data->GetBufferLen() << ")\n";
+        // }
     }
 
     void onOneWayAudioRawDataReceived(AudioRawData *, uint32_t) override {}
@@ -223,11 +322,14 @@ public:
                  ", type=" + std::to_string((int)s->GetAudioType()) +
                  ", status=" + std::to_string((int)s->GetStatus()));
         }
+        emit_roster_names(meetingService);
     }
     void onUserActiveAudioChange(IList<unsigned int> *lst) override
     {
         if (!lst)
             return;
+
+        // Log active UIDs
         std::string uids;
         for (int i = 0; i < lst->GetCount(); ++i)
         {
@@ -236,6 +338,12 @@ public:
             uids += std::to_string(lst->GetItem(i));
         }
         info("Active audio: " + uids);
+
+        // Send to Node on UDP 7100 as: active=uid,uid,uid
+        send_udp_line(7100, std::string("active=") + uids);
+
+        // Keep the name map fresh
+        emit_roster_names(meetingService);
     }
 
     void onHostRequestStartAudio(IRequestStartAudioHandler *) override {}
@@ -400,30 +508,6 @@ static void close_pcm_socket()
     }
 }
 
-static void emit_roster_names(IMeetingService *ms)
-{
-    if (!ms)
-        return;
-    auto pc = ms->GetMeetingParticipantsController();
-    if (!pc)
-        return;
-    auto lst = pc->GetParticipantsList();
-    if (!lst)
-        return;
-
-    std::string line = "map=";
-    for (int i = 0; i < lst->GetCount(); ++i)
-    {
-        auto uid = lst->GetItem(i);
-        auto info = pc->GetUserByUserID(uid);
-        const char *nm = (info && info->GetUserName()) ? info->GetUserName() : "User";
-        if (i)
-            line += '|';
-        line += std::to_string(uid) + ":" + std::string(nm);
-    }
-    send_udp_line(7101, line);
-}
-
 class MyMeetingEventHandler : public IMeetingServiceEvent
 {
 public:
@@ -540,27 +624,24 @@ public:
                         error("RequestLocalRecordingPrivilege failed: " + std::to_string(req));
                 }
 
-                // Get helper now (subscription happens after StartRawRecording succeeds)
                 g_audioHelper = GetAudioRawdataHelper();
                 if (!g_audioHelper)
                 {
                     error("GetAudioRawdataHelper() returned null");
                 }
 
-                // Initial roster + periodic refresh
                 emit_roster_names(meetingService);
 
-                static std::atomic<bool> roster_refresh_running{false};
-                if (!roster_refresh_running.exchange(true))
+                if (!g_roster_refresh_running.exchange(true))
                 {
-                    std::thread([&roster_refresh_running]()
+                    std::thread([]()
                                 {
-                while (true) {
-                    std::this_thread::sleep_for(std::chrono::seconds(10));
-                    if (!meetingService) break;              // stop after meeting ends
-                    emit_roster_names(meetingService);
-                }
-                roster_refresh_running = false; })
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            if (!meetingService) break;               
+            emit_roster_names(meetingService);        
+        }
+        g_roster_refresh_running = false; })
                         .detach();
                 }
             }
