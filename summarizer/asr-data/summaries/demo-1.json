@@ -1,0 +1,27 @@
+{
+  "summary": "The team had a quick sync to confirm the shipping of the beta version on Monday. Bob will update the documentation by Friday, and Carol raised a risk regarding the timing of the infrastructure migration.",
+  "decisions": [
+    {
+      "decision": "Ship beta on Monday"
+    }
+  ],
+  "action_items": [
+    {
+      "description": "Update the documentation",
+      "owner": "Bob",
+      "due": "Friday"
+    },
+    {
+      "description": "Verify staging",
+      "owner": "Carol",
+      "due": null
+    }
+  ],
+  "risks": [
+    {
+      "description": "Infrastructure migration timing",
+      "owner": "Carol"
+    }
+  ],
+  "follow_ups": []
+}
