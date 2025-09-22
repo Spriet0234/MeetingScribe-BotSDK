@@ -4,14 +4,17 @@ services:
       context: .
       dockerfile: Dockerfile
     image: whispr-asr:cpu
+    env_file: .env
     environment:
       MODEL: small.en
       DEVICE: cpu
       COMPUTE: int8
       PORT: "8080"
-      DATA_DIR: /data              
+      DATA_DIR: /data    
+            
     volumes:
-      - ./asr-data:/data           
+       - ./asr-data:/data
+       - ~/.aws:/root/.aws:ro          
     expose:
       - "8080"                     
     restart: unless-stopped

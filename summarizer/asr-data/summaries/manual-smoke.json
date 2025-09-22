@@ -1,0 +1,17 @@
+{
+  "summary": "The team has decided to ship the product on Monday. Bob will update the documentation.",
+  "decisions": [
+    {
+      "decision": "Ship the product on Monday."
+    }
+  ],
+  "action_items": [
+    {
+      "description": "Update the documentation.",
+      "owner": "Bob",
+      "due": "Friday"
+    }
+  ],
+  "risks": [],
+  "follow_ups": []
+}

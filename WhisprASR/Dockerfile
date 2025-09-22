@@ -6,7 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir aiohttp faster-whisper numpy
+RUN pip install --no-cache-dir aiohttp faster-whisper numpy boto3
+
 
 COPY server.py /app/server.py
 

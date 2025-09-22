@@ -10,6 +10,12 @@ from collections import deque
 import numpy as np
 from aiohttp import web, WSMsgType
 from faster_whisper import WhisperModel
+import aiohttp
+import boto3
+
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+S3_BUCKET = os.getenv("S3_BUCKET", "")
+S3_PREFIX_TRANSCRIPTS = os.getenv("S3_PREFIX_TRANSCRIPTS", "transcripts")
 
 # ───────── Config ─────────
 MODEL_NAME = os.getenv("MODEL", "small.en")
@@ -46,6 +52,40 @@ logging.info("Model ready.")
 # ───────── Speaker state (fed by UDP from the bot) ─────────
 current_active_ids: List[str] = []
 name_map: Dict[str, str] = {}
+
+
+_s3 = None
+def _s3_client():
+    global _s3
+    if _s3 is None:
+        _s3 = boto3.client("s3", region_name=AWS_REGION)
+    return _s3
+
+_uploaded_flag_attr = "_uploaded_to_s3"
+
+def _upload_transcript_jsonl_to_s3(local_path: str, session_id: str) -> str:
+    key = f"{S3_PREFIX_TRANSCRIPTS.rstrip('/')}/{session_id}.jsonl"
+    logging.info(f"[s3] put_object -> s3://{S3_BUCKET}/{key}")
+    with open(local_path, "rb") as f:
+        _s3_client().put_object(Bucket=S3_BUCKET, Key=key, Body=f,
+                                ContentType="application/x-ndjson")
+    logging.info(f"[s3] uploaded: s3://{S3_BUCKET}/{key}")
+    return f"s3://{S3_BUCKET}/{key}"
+
+
+SUMMARIZER_URL = os.getenv("SUMMARIZER_URL", "http://summarizer:8000/jobs")
+
+async def enqueue_summary_job(session_id: str, transcript_jsonl_abs: str, model: str = None):
+    payload = {"session_id": session_id, "transcript_url": transcript_jsonl_abs}
+    if model: payload["model"] = model
+    async with aiohttp.ClientSession() as http:
+        async with http.post(SUMMARIZER_URL, json=payload) as resp:
+            if resp.status >= 300:
+                txt = await resp.text()
+                raise RuntimeError(f"enqueue failed: {resp.status} {txt}")
+            return await resp.json()
+
+
 
 def current_speaker_label() -> Tuple[str, str]:
     uid = current_active_ids[0] if current_active_ids else ""
@@ -138,19 +178,18 @@ class TranscriptRecorderJSONL:
         logging.info(f"[transcript] live → {self.jsonl_path}")
 
     def add_event(self, etype: str, t0: float, t1: float, text: str, uid: str, name: str):
-    # 🔒 Only persist finals; skip partials entirely
-    if etype != "final":
-        return
-    obj = {
-        "time": time.time(),
-        "type": etype,
-        "t0": float(t0),
-        "t1": float(t1),
-        "text": text,
-        "speaker": {"uid": uid, "name": name}
-    }
-    self._fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
-    self._fh.flush()
+        if etype != "final":
+            return
+        obj = {
+            "time": time.time(),
+            "type": etype,
+            "t0": float(t0),
+            "t1": float(t1),
+            "text": text,
+            "speaker": {"uid": uid, "name": name}
+        }
+        self._fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        self._fh.flush()
 
 
     def close_and_write_summary(self):
@@ -307,8 +346,10 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                     logging.info(f"Stream started: sr={client_sr}, lang={language}, session={ws._recorder.session_id}")  # type: ignore[attr-defined]
 
                 elif payload.get("type") == "stop":
+                    # Finish any remaining audio as a final segment
                     async with decode_lock:
                         final_text, t0, t1 = await run_decode(list(utter_buf), 0, language)
+
                     if final_text:
                         uid, name = current_speaker_label()
                         await ws.send_json({
@@ -322,10 +363,56 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                         logging.info(f"[final][{name}] {final_text}")
 
                     if ws._recorder:
-                        ws._recorder.close_and_write_summary()
+                        summary_path = ws._recorder.close_and_write_summary()
+
+                        # --- Upload transcript to S3 (separate try so errors are visible) ---
+                        s3_url = None
+                        if S3_BUCKET:
+                            try:
+                                s3_url = _upload_transcript_jsonl_to_s3(
+                                    ws._recorder.jsonl_path, ws._recorder.session_id  # type: ignore[attr-defined]
+                                )
+                                setattr(ws, _uploaded_flag_attr, True)
+                                logging.info(f"[s3] uploaded (stop): {s3_url}")
+                                # Optional: tell the client where it landed
+                                await ws.send_json({"type": "uploaded", "transcript_s3": s3_url})
+                            except Exception:
+                                logging.exception("[s3] upload failed during stop")
+
+                        else:
+                            # Local-only mode (no S3 bucket configured)
+                            jsonl_abs = os.path.abspath(ws._recorder.jsonl_path)  # type: ignore[attr-defined]
+                            s3_url = f"local://{jsonl_abs}"
+                            logging.info(f"[local] transcript at {s3_url}")
+
+                        # --- Enqueue summarizer (do not mask S3 errors) ---
+                        try:
+                            job = await enqueue_summary_job(
+                                session_id=ws._recorder.session_id,  # type: ignore[attr-defined]
+                                transcript_jsonl_abs=s3_url or "",
+                                model=os.getenv("SUMMARY_MODEL") or None
+                            )
+                            logging.info(f"[summarizer] enqueued job: {job}")
+                        except Exception:
+                            logging.exception("[summarizer] enqueue failed")
+
+                        # --- Optional: delete local files after successful upload ---
+                        DELETE_LOCAL = os.getenv("DELETE_LOCAL_AFTER_UPLOAD", "false").lower() == "true"
+                        if DELETE_LOCAL:
+                            try:
+                                os.remove(ws._recorder.jsonl_path)  # type: ignore[attr-defined]
+                            except Exception:
+                                logging.exception("[cleanup] failed to remove transcript jsonl")
+                            try:
+                                os.remove(summary_path)
+                            except Exception:
+                                logging.exception("[cleanup] failed to remove summary json")
+
                     await ws.close()
                     logging.info("WS closed (stop)")
                     break
+
+
 
                 else:
                     await ws.send_json({"type": "error", "error": "unknown_control_message"})
