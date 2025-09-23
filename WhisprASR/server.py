@@ -73,7 +73,9 @@ def _upload_transcript_jsonl_to_s3(local_path: str, session_id: str) -> str:
     return f"s3://{S3_BUCKET}/{key}"
 
 
-SUMMARIZER_URL = os.getenv("SUMMARIZER_URL", "http://summarizer:8000/jobs")
+SUMMARIZER_URL = os.getenv("SUMMARIZER_URL", "http://summarizer:9001/jobs")
+logging.info(f"SUMMARIZER_URL={SUMMARIZER_URL}")
+
 
 async def enqueue_summary_job(session_id: str, transcript_jsonl_abs: str, model: str = None):
     payload = {"session_id": session_id, "transcript_url": transcript_jsonl_abs}
@@ -294,6 +296,18 @@ async def decode_tail_partial(
         logging.info(f"[partial][{name}] {text}")
     except Exception as e:
         logging.warning(f"Partial decode failed: {e}")
+# ───────── S3 URL helpers ─────────
+def _s3_key_for_session(session_id: str) -> str:
+    return f"{S3_PREFIX_TRANSCRIPTS.rstrip('/')}/{session_id}.jsonl"
+
+def _presigned_get_for_session(session_id: str, expires=3600) -> str:
+    key = _s3_key_for_session(session_id)
+    return _s3_client().generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=expires,
+    )
+
 
 # ───────── WS Handler ─────────
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -386,15 +400,33 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                             logging.info(f"[local] transcript at {s3_url}")
 
                         # --- Enqueue summarizer (do not mask S3 errors) ---
+                                                # --- Enqueue summarizer (use presigned URL if S3) ---
                         try:
+                            presigned = None
+                            if S3_BUCKET and s3_url and s3_url.startswith("s3://"):
+                                ttl = int(os.getenv("PRESIGNED_TTL", "3600"))
+                                presigned = _presigned_get_for_session(ws._recorder.session_id, expires=ttl)
+                                # (optional) emit to client for debugging
+                                await ws.send_json({"type": "uploaded", "transcript_presigned": presigned})
+
+                            # Prefer presigned HTTP; fall back to whatever we have
+                            transcript_for_job = presigned or (s3_url or "")
+                            if not transcript_for_job:
+                                # Nothing uploaded? fall back to local absolute path reference
+                                # NOTE: This only works if the same path is mounted into the summarizer container.
+                                transcript_for_job = f"local://{os.path.abspath(ws._recorder.jsonl_path)}"  # type: ignore[attr-defined]
+                                logging.warning(f"[enqueue] falling back to local path: {transcript_for_job}")
+
+                            logging.info(f"[enqueue] posting to {SUMMARIZER_URL} with session_id={ws._recorder.session_id}")
                             job = await enqueue_summary_job(
                                 session_id=ws._recorder.session_id,  # type: ignore[attr-defined]
-                                transcript_jsonl_abs=s3_url or "",
+                                transcript_jsonl_abs=transcript_for_job,
                                 model=os.getenv("SUMMARY_MODEL") or None
                             )
                             logging.info(f"[summarizer] enqueued job: {job}")
                         except Exception:
                             logging.exception("[summarizer] enqueue failed")
+
 
                         # --- Optional: delete local files after successful upload ---
                         DELETE_LOCAL = os.getenv("DELETE_LOCAL_AFTER_UPLOAD", "false").lower() == "true"
