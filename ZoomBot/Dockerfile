@@ -50,4 +50,3 @@ RUN ln -s /usr/bin/nodejs /usr/local/bin/node
 
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["--help"]

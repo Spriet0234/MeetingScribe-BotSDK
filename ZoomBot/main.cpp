@@ -63,6 +63,16 @@ static std::unordered_map<unsigned int, std::string> g_uid_to_name;
 
 static int g_pcm_sock = -1;
 
+static std::atomic<bool> g_sdkReady{false};
+static std::atomic<bool> g_inMeeting{false};
+static std::atomic<bool> g_idleMode{false};
+
+static std::mutex g_job_mx;
+static std::condition_variable g_job_cv;
+static std::string g_next_meeting_id;
+static std::string g_next_passcode;
+static std::string g_next_zak;
+
 static std::string zchar_to_utf8(const zchar_t *z)
 {
     if (!z)
@@ -113,6 +123,126 @@ static inline void error(const std::string &msg)
 {
     if (!g_quiet)
         std::cerr << msg << std::endl;
+}
+
+static void control_listener_thread()
+{
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0)
+    {
+        error("[idle] socket() failed");
+        return;
+    }
+    int opt = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(7600);
+    // bind to all interfaces so host -> -p 7600:7600 always reaches us
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(srv, (sockaddr *)&addr, sizeof(addr)) != 0)
+    {
+        perror("[idle] bind 0.0.0.0:7600");
+        close(srv);
+        return;
+    }
+    if (listen(srv, 16) != 0)
+    {
+        perror("[idle] listen");
+        close(srv);
+        return;
+    }
+    info("[idle] control listener on 0.0.0.0:7600");
+
+    auto send_all = [](int fd, const std::string &s)
+    {
+        const char *p = s.data();
+        size_t n = s.size();
+        while (n)
+        {
+            ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
+            if (w <= 0)
+                break;
+            p += w;
+            n -= size_t(w);
+        }
+    };
+
+    while (true)
+    {
+        sockaddr_in peer{};
+        socklen_t plen = sizeof(peer);
+        int c = accept(srv, (sockaddr *)&peer, &plen);
+        if (c < 0)
+            continue;
+
+        char peerip[64];
+        inet_ntop(AF_INET, &peer.sin_addr, peerip, sizeof(peerip));
+        info(std::string("[idle] accept from ") + peerip + ":" + std::to_string(ntohs(peer.sin_port)));
+
+        std::string buf;
+        char tmp[1024];
+        // read one line
+        while (true)
+        {
+            ssize_t r = recv(c, tmp, sizeof(tmp), 0);
+            if (r <= 0)
+                break;
+            buf.append(tmp, tmp + r);
+            auto pos = buf.find('\n');
+            if (pos != std::string::npos)
+            {
+                buf.resize(pos);
+                break;
+            }
+            if (buf.size() > 64 * 1024)
+                break;
+        }
+        info(std::string("[idle] received: ") + buf);
+
+        try
+        {
+            auto j = json::parse(buf);
+            std::string mid = j.at("meeting_id").get<std::string>();
+            std::string pwd = j.value("passcode", "");
+            std::string zak = j.value("zak", "");
+            if (!g_sdkReady.load())
+            {
+                send_all(c, "ERR not_ready\n");
+                info("[idle] replied: ERR not_ready");
+            }
+            else if (g_inMeeting.load())
+            {
+                send_all(c, "ERR busy\n");
+                info("[idle] replied: ERR busy");
+            }
+            else
+            {
+                {
+                    std::lock_guard<std::mutex> lk(g_job_mx);
+                    g_next_meeting_id = mid;
+                    g_next_passcode = pwd;
+                    g_next_zak = zak;
+                }
+                g_job_cv.notify_one();
+                send_all(c, "OK queued\n");
+                info(std::string("[idle] queued job for meeting ") + mid);
+            }
+        }
+        catch (const std::exception &e)
+        {
+            send_all(c, "ERR bad_json\n");
+            info(std::string("[idle] replied: ERR bad_json: ") + e.what());
+        }
+        catch (...)
+        {
+            send_all(c, "ERR bad_json\n");
+            info("[idle] replied: ERR bad_json (unknown)");
+        }
+        close(c);
+    }
 }
 
 class WavWriter
@@ -587,19 +717,12 @@ public:
         switch (status)
         {
         case MEETING_STATUS_CONNECTING:
+            g_inMeeting = true;
             print_status("Connecting to meeting...");
-            break;
-        case MEETING_STATUS_WAITINGFORHOST:
-            print_status("Waiting for host to start");
-            break;
-        case MEETING_STATUS_IN_WAITING_ROOM:
-            print_status("In waiting room");
-            break;
-        case MEETING_STATUS_RECONNECTING:
-            print_status("Reconnecting");
             break;
 
         case MEETING_STATUS_INMEETING:
+            g_inMeeting = true;
             info("Joined meeting");
             if (meetingService)
             {
@@ -626,9 +749,7 @@ public:
 
                 g_audioHelper = GetAudioRawdataHelper();
                 if (!g_audioHelper)
-                {
                     error("GetAudioRawdataHelper() returned null");
-                }
 
                 emit_roster_names(meetingService);
 
@@ -636,12 +757,12 @@ public:
                 {
                     std::thread([]()
                                 {
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::seconds(10));
-            if (!meetingService) break;               
-            emit_roster_names(meetingService);        
-        }
-        g_roster_refresh_running = false; })
+                        while (true) {
+                            std::this_thread::sleep_for(std::chrono::seconds(10));
+                            if (!meetingService) break;
+                            emit_roster_names(meetingService);
+                        }
+                        g_roster_refresh_running = false; })
                         .detach();
                 }
             }
@@ -658,6 +779,7 @@ public:
                           ", desc=" + (last->GetErrorDescription() ? last->GetErrorDescription() : ""));
                 }
                 stopRecordingAndCleanup();
+                g_inMeeting = false;
                 if (authLoop)
                     g_main_loop_quit(authLoop);
                 quitCalled = true;
@@ -667,8 +789,15 @@ public:
         case MEETING_STATUS_DISCONNECTING:
         case MEETING_STATUS_ENDED:
             stopRecordingAndCleanup();
+            g_inMeeting = false;
             if (authLoop)
                 g_main_loop_quit(authLoop);
+            break;
+
+        case MEETING_STATUS_WAITINGFORHOST:
+        case MEETING_STATUS_IN_WAITING_ROOM:
+        case MEETING_STATUS_RECONNECTING:
+            print_status("ℹ️ Status change");
             break;
 
         default:
@@ -746,7 +875,6 @@ void joinMeeting(const std::string &meetingId, const std::string &userName,
         std::cerr << "Join failed: " << err << std::endl;
 }
 
-// ─── Auth events ─────────────────────────────────────────────────────────────────
 class MyAuthEventHandler : public IAuthServiceEvent
 {
 public:
@@ -754,8 +882,16 @@ public:
     {
         if (result == AUTHRET_SUCCESS)
         {
-            std::cout << "✅ Auth success – joining " << g_meetingId << std::endl;
-            joinMeeting(g_meetingId, "MyBot", passcodeGlobal, zakGlobal);
+            g_sdkReady = true;
+            if (!g_idleMode.load() && !g_meetingId.empty())
+            {
+                std::cout << "✅ Auth success – joining " << g_meetingId << std::endl;
+                joinMeeting(g_meetingId, "MyBot", passcodeGlobal, zakGlobal);
+            }
+            else
+            {
+                info("✅ Auth success – idle mode active, waiting for meeting credentials");
+            }
         }
         else
         {
@@ -769,11 +905,9 @@ public:
     void onZoomAuthIdentityExpired() override {}
     void onLoginReturnWithReason(LOGINSTATUS, IAccountInfo *, LoginFailReason) override {}
 };
-
-// ─── main ────────────────────────────────────────────────────────────────────────
 int main(int argc, char *argv[])
 {
-    std::vector<std::string> positional;
+    bool want_help = false;
     for (int i = 1; i < argc; ++i)
     {
         std::string a = argv[i];
@@ -782,18 +916,55 @@ int main(int argc, char *argv[])
             g_quiet = true;
             continue;
         }
+        if (a == "--idle")
+        {
+            g_idleMode = true;
+            continue;
+        }
+        if (a == "--help" || a == "-h")
+        {
+            want_help = true;
+            continue;
+        }
+        // positional collection stays for non-idle mode
+        if (a.size())
+        {
+            // keep original behavior
+            // note: we will parse positionals after flag scan
+        }
+    }
+
+    // rebuild positional (to preserve your original parsing)
+    std::vector<std::string> positional;
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string a = argv[i];
+        if (a == "--quiet" || a == "-q" || a == "--idle" || a == "--help" || a == "-h")
+            continue;
         positional.push_back(a);
     }
-    if (positional.size() < 1)
+
+    if (want_help)
     {
-        std::cerr << "Usage: zoom_bot [--quiet|-q] <meetingNumber> [passcode] [zakToken]\n";
-        return 1;
+        std::cerr << "Usage: zoom_bot [--quiet|-q] [--idle] <meetingNumber> [passcode] [zakToken]\n";
+        std::cerr << "       --idle = start authenticated and wait for JSON on 127.0.0.1:7600\n";
+        return 0;
     }
-    g_meetingId = positional[0];
-    if (positional.size() >= 2)
-        passcodeGlobal = positional[1];
-    if (positional.size() >= 3)
-        zakGlobal = positional[2];
+
+    // In non-idle mode we still require a meeting id (keep your current UX)
+    if (!g_idleMode.load())
+    {
+        if (positional.size() < 1)
+        {
+            std::cerr << "Usage: zoom_bot [--quiet|-q] <meetingNumber> [passcode] [zakToken]\n";
+            return 1;
+        }
+        g_meetingId = positional[0];
+        if (positional.size() >= 2)
+            passcodeGlobal = positional[1];
+        if (positional.size() >= 3)
+            zakGlobal = positional[2];
+    }
 
     auto jwtToken = fetchJwtToken();
     if (jwtToken.empty())
@@ -839,10 +1010,44 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    // If idle mode, spin up control listener + a waiter that joins when a job arrives
+    std::thread ctl;
+    if (g_idleMode.load())
+    {
+        ctl = std::thread(control_listener_thread);
+
+        std::thread waiter([]()
+                           {
+            // Wait for auth first
+            while (!g_sdkReady.load()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            info("[idle] ready for jobs");
+
+            while (true) {
+                std::unique_lock<std::mutex> lk(g_job_mx);
+                g_job_cv.wait(lk, []{ return !g_next_meeting_id.empty(); });
+                std::string mid = g_next_meeting_id;
+                std::string pwd = g_next_passcode;
+                std::string zak = g_next_zak;
+                g_next_meeting_id.clear(); g_next_passcode.clear(); g_next_zak.clear();
+                lk.unlock();
+
+                info("[idle] received job – joining " + mid);
+                joinMeeting(mid, "MyBot", pwd, zak);
+
+                // Wait until meeting finishes before accepting another
+                while (g_inMeeting.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                info("[idle] meeting complete – ready for next job");
+            } });
+        waiter.detach();
+    }
+
     authLoop = g_main_loop_new(nullptr, FALSE);
     g_main_loop_run(authLoop);
     g_main_loop_unref(authLoop);
 
     CleanUPSDK();
+
+    if (ctl.joinable())
+        ctl.detach();
     return 0;
 }
