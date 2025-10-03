@@ -2,6 +2,7 @@
 FROM ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG SDK_DIR_NAME=zoom-meeting-sdk-linux_x86_64-6.5.5.3543
 
 # Core build/runtime deps
 RUN set -eux; \
@@ -23,8 +24,10 @@ RUN set -eux; \
     libxcb-keysyms1-dev libxcb-xfixes0-dev libxcb-shape0-dev libxcb-xtest0-dev \
     xvfb xauth \
     nodejs npm \
-    ; rm -rf /var/lib/apt/lists/*
+    netcat-openbsd; \
+    rm -rf /var/lib/apt/lists/*
 
+# Single-header nlohmann/json
 RUN mkdir -p /usr/include/nlohmann \
     && curl -fsSL https://raw.githubusercontent.com/nlohmann/json/v3.11.3/single_include/nlohmann/json.hpp \
     -o /usr/include/nlohmann/json.hpp
@@ -33,20 +36,26 @@ RUN mkdir -p /usr/include/nlohmann \
 WORKDIR /app/ZoomBot
 COPY . /app/ZoomBot
 
+COPY ${SDK_DIR_NAME}/ /app/ZoomBot/${SDK_DIR_NAME}/
+ENV SDK_SYNC=copy
+
+# Zoom client config
 RUN mkdir -p /root/.config \
     && printf "%s\n" "system.audio.type=default" > /root/.config/zoomus.conf
 
 ENV QT_QPA_PLATFORM=offscreen \
-    LD_LIBRARY_PATH=/app/ZoomBot:/app/ZoomBot/qt_libs/Qt/lib \
-    QT_PLUGIN_PATH=/app/ZoomBot/qt_libs/Qt/plugins
+    LD_LIBRARY_PATH=/app/ZoomBot/sdk/lib:/app/ZoomBot/sdk/qt_libs/Qt/lib \
+    QT_PLUGIN_PATH=/app/ZoomBot/sdk/qt_libs/Qt/plugins
 
+RUN printf "%s\n" "/app/ZoomBot/sdk/lib" "/app/ZoomBot/sdk/qt_libs/Qt/lib" > /etc/ld.so.conf.d/zoombot.conf \
+    && ldconfig
+
+# Entrypoint
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-#For node
-RUN cd /app/ZoomBot && npm init -y && npm install ws --omit=dev
-RUN ln -s /usr/bin/nodejs /usr/local/bin/node
+RUN cd /app/ZoomBot && npm init -y && npm install ws --omit=dev \
+    && ln -sf /usr/bin/nodejs /usr/local/bin/node
 
-
-
+EXPOSE 7601
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
