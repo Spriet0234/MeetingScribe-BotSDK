@@ -8,8 +8,8 @@ ARG SDK_DIR_NAME=zoom-meeting-sdk-linux_x86_64-6.5.5.3543
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-    ca-certificates \
-    build-essential cmake pkg-config curl \
+    ca-certificates curl gnupg \
+    build-essential cmake pkg-config \
     libcurl4-openssl-dev \
     libglib2.0-dev libglib2.0-0 \
     libx11-6 libx11-xcb1 libxcb1 \
@@ -23,9 +23,17 @@ RUN set -eux; \
     libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-image0-dev \
     libxcb-keysyms1-dev libxcb-xfixes0-dev libxcb-shape0-dev libxcb-xtest0-dev \
     xvfb xauth \
-    nodejs npm \
     netcat-openbsd; \
     rm -rf /var/lib/apt/lists/*
+
+# Install Node 18 from NodeSource (modern enough for AWS SDK v3)
+RUN set -eux; \
+    ARCH="$(dpkg --print-architecture)"; \
+    curl -fsSL https://deb.nodesource.com/setup_18.x | bash -; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends nodejs; \
+    rm -rf /var/lib/apt/lists/*; \
+    ln -sf /usr/bin/node /usr/local/bin/node
 
 # Single-header nlohmann/json
 RUN mkdir -p /usr/include/nlohmann \
@@ -36,6 +44,7 @@ RUN mkdir -p /usr/include/nlohmann \
 WORKDIR /app/ZoomBot
 COPY . /app/ZoomBot
 
+# Copy Zoom SDK drop-in
 COPY ${SDK_DIR_NAME}/ /app/ZoomBot/${SDK_DIR_NAME}/
 ENV SDK_SYNC=copy
 
@@ -50,12 +59,17 @@ ENV QT_QPA_PLATFORM=offscreen \
 RUN printf "%s\n" "/app/ZoomBot/sdk/lib" "/app/ZoomBot/sdk/qt_libs/Qt/lib" > /etc/ld.so.conf.d/zoombot.conf \
     && ldconfig
 
+# (Optional) debugger
+RUN apt-get update && apt-get install -y --no-install-recommends gdb && rm -rf /var/lib/apt/lists/*
+
 # Entrypoint
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-RUN cd /app/ZoomBot && npm init -y && npm install ws --omit=dev \
-    && ln -sf /usr/bin/nodejs /usr/local/bin/node
+# Node deps (install once)
+RUN cd /app/ZoomBot \
+    && npm init -y \
+    && npm install --omit=dev ws @aws-sdk/client-s3
 
-EXPOSE 7601
+EXPOSE 7000 7600 7601
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

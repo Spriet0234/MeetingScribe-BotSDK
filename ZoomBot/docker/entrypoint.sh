@@ -1,44 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =========================
-# ZoomBot Entrypoint (full)
-# =========================
-# Modes:
-#   - BOT_IDLE=1 : start in idle mode (controller on 127.0.0.1:7600)
-#   - USE_XVFB=1 : run Qt under Xvfb (else offscreen)
-#
-# Key env (with defaults):
-#   HTTP_CONTROL_ENABLED=1
-#   HTTP_CONTROL_PORT=7601
-#   IDLE_TCP_HOST=127.0.0.1
-#   IDLE_TCP_PORT=7600
-#   ASR_WS_URL=ws://127.0.0.1:1  (silenced by default for tests)
-#   SDK_SYNC=copy|move (if you want to import zoom-meeting-sdk-linux_* into /app/ZoomBot/sdk)
-#
-# Assumptions:
-#   - SDK is baked in the image at /app/ZoomBot/zoom-meeting-sdk-linux_*
-#   - Dockerfile already registered ld.so paths:
-#       /app/ZoomBot/sdk/lib
-#       /app/ZoomBot/sdk/qt_libs/Qt/lib
-
-# ---------- Help ----------
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  cat <<'USAGE'
-Usage: docker run <image> [<meetingNumber> [passcode] [zakToken]]
-Env:
-  BOT_IDLE=1                          Start in idle mode (listen on 127.0.0.1:7600)
-  HTTP_CONTROL_ENABLED=1              Enable HTTP gateway
-  HTTP_CONTROL_PORT=7601              Gateway port
-  IDLE_TCP_HOST=127.0.0.1             Controller host
-  IDLE_TCP_PORT=7600                  Controller port
-  USE_XVFB=1                          Run bot under Xvfb (Qt xcb)
-  SDK_SYNC=copy|move                  Import zoom-meeting-sdk-linux_* into /app/ZoomBot/sdk at start
-  ASR_WS_URL=ws://127.0.0.1:1         ASR bridge endpoint (set to a real ws://host:port/ws to enable)
-  MEETING_NUMBER / MEETING_PASSCODE / MEETING_ZAK  (non-idle mode)
-USAGE
-  exit 0
-fi
+echo "[entrypoint] version=2025-10-05a (bridge-first, no-idle by default)"
 
 # ---------- Paths ----------
 SDK_ROOT=/app/ZoomBot
@@ -47,11 +10,9 @@ BUILD_DIR="$SDK_ROOT/build"
 
 export HOME="${HOME:-/app}"
 mkdir -p "$HOME/.config"
-if [[ ! -f "$HOME/.config/zoomus.conf" ]]; then
-  echo "system.audio.type=default" > "$HOME/.config/zoomus.conf"
-fi
+[[ -f "$HOME/.config/zoomus.conf" ]] || echo "system.audio.type=default" > "$HOME/.config/zoomus.conf"
 
-# ---------- Optional PulseAudio (no-op if missing) ----------
+# ---------- Audio (optional) ----------
 if command -v pulseaudio >/dev/null 2>&1; then
   pulseaudio --check >/dev/null 2>&1 || true
   pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1 || true
@@ -61,126 +22,166 @@ if command -v pulseaudio >/dev/null 2>&1; then
   fi
 fi
 
-# ---------- Import SDK if requested ----------
+# ---------- SDK sync (optional) ----------
 if [[ "${SDK_SYNC:-}" == "copy" || "${SDK_SYNC:-}" == "move" ]]; then
   PKG_DIR=$(ls -d "$SDK_ROOT"/zoom-meeting-sdk-linux_* 2>/dev/null | head -n1 || true)
-  if [[ -z "${PKG_DIR}" || ! -d "${PKG_DIR}" ]]; then
-    echo "SDK_SYNC=$SDK_SYNC set, but no zoom-meeting-sdk-linux_* directory under $SDK_ROOT" >&2
-    exit 2
-  fi
-  echo "Syncing Zoom SDK from $(basename "$PKG_DIR") into sdk/ (mode=${SDK_SYNC})"
+  [[ -n "$PKG_DIR" && -d "$PKG_DIR" ]] || { echo "SDK_SYNC=$SDK_SYNC set, but no SDK found"; exit 2; }
+  echo "Syncing SDK from $(basename "$PKG_DIR") -> sdk/ (mode=$SDK_SYNC)"
   mkdir -p "$SDK_DIR" "$SDK_DIR/lib"
-
-  # headers (include/ or h/)
-  if [[ -d "$PKG_DIR/include" ]]; then
-    rm -rf "$SDK_DIR/include"
-    [[ "$SDK_SYNC" == "move" ]] && mv -f "$PKG_DIR/include" "$SDK_DIR/" || cp -a "$PKG_DIR/include" "$SDK_DIR/"
-  elif [[ -d "$PKG_DIR/h" ]]; then
-    rm -rf "$SDK_DIR/h"
-    [[ "$SDK_SYNC" == "move" ]] && mv -f "$PKG_DIR/h" "$SDK_DIR/" || cp -a "$PKG_DIR/h" "$SDK_DIR/"
-  fi
-
-  # qt libs
-  if [[ -d "$PKG_DIR/qt_libs" ]]; then
-    rm -rf "$SDK_DIR/qt_libs"
-    [[ "$SDK_SYNC" == "move" ]] && mv -f "$PKG_DIR/qt_libs" "$SDK_DIR/" || cp -a "$PKG_DIR/qt_libs" "$SDK_DIR/"
-  fi
-
-  # core .so
+  [[ -d "$PKG_DIR/include" ]] && { rm -rf "$SDK_DIR/include"; cp -a "$PKG_DIR/include" "$SDK_DIR/" || true; }
+  [[ -d "$PKG_DIR/h" ]] &&       { rm -rf "$SDK_DIR/h";       cp -a "$PKG_DIR/h"       "$SDK_DIR/" || true; }
+  [[ -d "$PKG_DIR/qt_libs" ]] && { rm -rf "$SDK_DIR/qt_libs"; cp -a "$PKG_DIR/qt_libs" "$SDK_DIR/" || true; }
   for lib in libmeetingsdk.so libmpg123.so libcml.so; do
-    if [[ -f "$PKG_DIR/$lib" ]]; then
-      [[ "$SDK_SYNC" == "move" ]] && mv -f "$PKG_DIR/$lib" "$SDK_DIR/lib/" || cp -a "$PKG_DIR/$lib" "$SDK_DIR/lib/"
-    fi
+    [[ -f "$PKG_DIR/$lib" ]] && cp -a "$PKG_DIR/$lib" "$SDK_DIR/lib/"
   done
 fi
 
-# ---------- Verify SDK presence ----------
+# ---------- Verify SDK ----------
 SDK_INC_DIR=""
 for d in "$SDK_DIR/include" "$SDK_DIR/h"; do
   [[ -f "$d/zoom_sdk.h" ]] && SDK_INC_DIR="$d" && break
 done
-[[ -f "$SDK_DIR/lib/libmeetingsdk.so" ]] || { echo "Missing sdk/lib/libmeetingsdk.so"; exit 2; }
-[[ -d "$SDK_DIR/qt_libs" ]] || { echo "Missing sdk/qt_libs"; exit 2; }
-[[ -n "$SDK_INC_DIR" ]] || { echo "Missing headers (sdk/include or sdk/h)"; exit 2; }
+[[ -f "$SDK_DIR/lib/libmeetingsdk.so" ]] || { echo "Missing libmeetingsdk.so"; exit 2; }
+[[ -d "$SDK_DIR/qt_libs" ]] || { echo "Missing qt_libs"; exit 2; }
+[[ -n "$SDK_INC_DIR" ]] || { echo "Missing headers"; exit 2; }
 [[ -f "$SDK_DIR/lib/libmeetingsdk.so.1" ]] || ln -sf libmeetingsdk.so "$SDK_DIR/lib/libmeetingsdk.so.1"
 
-# ---------- Qt / Loader env for runtime ----------
+# ---------- Qt / Loader ----------
 export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
 export LD_LIBRARY_PATH="$SDK_DIR/lib:$SDK_DIR/qt_libs/Qt/lib:${LD_LIBRARY_PATH:-}"
 export QT_PLUGIN_PATH="$SDK_DIR/qt_libs/Qt/plugins"
-echo "[diag] LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-echo "[diag] QT_PLUGIN_PATH=$QT_PLUGIN_PATH"
-ls -1 "$SDK_DIR/qt_libs/Qt/lib/libQt5Quick.so"* >/dev/null 2>&1 || echo "[diag] QtQuick not found under $SDK_DIR/qt_libs/Qt/lib"
+printf "%s\n" "/app/ZoomBot/sdk/lib" "/app/ZoomBot/sdk/qt_libs/Qt/lib" > /etc/ld.so.conf.d/zoombot.conf
+ldconfig
 
-# ---------- Build (idempotent) ----------
+# ---------- Build ----------
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 cmake .. >/dev/null
 cmake --build . -j"$(nproc)"
 
-# ---------- Node ASR bridge (silent by default for testing) ----------
+# ---------- Node ASR bridge (Deepgram / AssemblyAI / null) ----------
 NODE_BIN="$(command -v node || command -v nodejs || true)"
-if [[ -z "$NODE_BIN" ]]; then
-  echo "ERROR: node not found in PATH" >&2
-  exit 2
-fi
-ASR_URL="${ASR_WS_URL:-ws://127.0.0.1:1}"
-echo "[entrypoint] starting ASR bridge with $NODE_BIN at /app/ZoomBot/asr_stream_client.js (ASR_WS_URL=$ASR_URL)"
-ASR_WS_URL="$ASR_URL" \
-BOT_PCM_PORT="${BOT_PCM_PORT:-7000}" \
-"$NODE_BIN" /app/ZoomBot/asr_stream_client.js &
+[[ -n "$NODE_BIN" ]] || { echo "ERROR: node not found" >&2; exit 2; }
 
-# ---------- Decide run mode ----------
+# Bridge env defaults
+export QUIET="${QUIET:-0}"             # show logs unless explicitly silenced
+export LOG_LEVEL="${LOG_LEVEL:-info}"
+export BOT_PCM_HOST="${BOT_PCM_HOST:-127.0.0.1}"
+export BOT_PCM_PORT="${BOT_PCM_PORT:-7000}"
+export ASR_PROVIDER="${ASR_PROVIDER:-deepgram}"
+# Expect DEEPGRAM_API_KEY / ASSEMBLYAI_API_KEY if those providers are used
+# Optional S3: AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET, S3_PREFIX, S3_FORMAT, S3_FLUSH_SECS, MEETING_ID
+
+# Extra diagnostics
+echo "[entrypoint] node=$($NODE_BIN -v 2>/dev/null || echo missing) cwd=$(pwd)"
+echo "[entrypoint] ls /app/ZoomBot:"
+ls -al /app/ZoomBot || true
+echo "[entrypoint] ls node_modules (if present):"
+ls -al /app/ZoomBot/node_modules 2>/dev/null || echo "(no node_modules visible)"
+
+# Run the bridge from the app dir (module resolution is unambiguous)
+cd /app/ZoomBot
+
+echo "[entrypoint] starting ASR bridge (provider=$ASR_PROVIDER, pcm=${BOT_PCM_HOST}:${BOT_PCM_PORT}, bucket=${S3_BUCKET:-unset})"
+# Stream logs to console *and* keep a file copy for postmortem
+set +e
+("$NODE_BIN" /app/ZoomBot/asr_stream_client.js) |& tee -a /var/log/asr_bridge.out &
+ASR_PID=$!
+set -e
+echo "[entrypoint] ASR bridge pid=$ASR_PID (logs also in /var/log/asr_bridge.out)"
+
+# Wait until the PCM server is actually listening
+wait_for_port() {
+  local host="$1" port="$2" max="$3" waited=0
+  while ! nc -z "$host" "$port" 2>/dev/null; do
+    sleep 0.5
+    waited=$((waited+1))
+    if (( waited >= max )); then
+      echo "[entrypoint] ERROR: PCM bridge not listening on $host:$port after $((max/2))s"
+      echo "----- last 120 lines of /var/log/asr_bridge.out -----"
+      tail -n 120 /var/log/asr_bridge.out || true
+      echo "-----------------------------------------------------"
+      exit 3
+    fi
+  done
+}
+wait_for_port "$BOT_PCM_HOST" "$BOT_PCM_PORT" 40   # 20 seconds max
+echo "[entrypoint] PCM bridge is live at ${BOT_PCM_HOST}:${BOT_PCM_PORT}"
+
+# ---------- Bot args (no idle by default) ----------
+: "${BOT_IDLE:=0}"  # default off; set BOT_IDLE=1 to enable idle mode
 BOT_ARGS=()
-if [[ "${BOT_IDLE:-0}" == "1" ]]; then
+PASS_ARGS=()
+
+if [[ "$BOT_IDLE" == "1" ]]; then
   BOT_ARGS+=( "--idle" )
-fi
-if [[ "${#BOT_ARGS[@]}" -eq 0 ]]; then
+else
   if [[ $# -eq 0 && -z "${MEETING_NUMBER:-}" ]]; then
     echo "Error: no args provided and MEETING_NUMBER not set. Use BOT_IDLE=1 for idle mode." >&2
+    kill "$ASR_PID" 2>/dev/null || true
     exit 2
   fi
-  # If no CLI args but MEETING_* env are present, transform them
   if [[ $# -eq 0 ]]; then
     set -- "${MEETING_NUMBER}" "${MEETING_PASSCODE:-}" "${MEETING_ZAK:-}"
   fi
+  PASS_ARGS=("$@")
 fi
 
-# ---------- Start bot first ----------
-start_bot() {
+# ---------- HTTP control gateway (optional) ----------
+start_http_gateway_once() {
+  [[ "${HTTP_CONTROL_ENABLED:-0}" != "1" ]] && return 0
+  if [[ -n "${HTTP_PID:-}" ]] && kill -0 "${HTTP_PID}" 2>/dev/null; then return 0; fi
+  local port="${HTTP_CONTROL_PORT:-7601}"
+  echo "[entrypoint] starting HTTP control gateway on :$port"
+  "$NODE_BIN" /app/ZoomBot/http_control_gateway.js &
+  HTTP_PID=$!
+}
+
+# ---------- Helpers ----------
+start_bot_once() {
   if [[ "${USE_XVFB:-}" == "1" ]]; then
-    echo "Starting under Xvfb (headless X11)."
-    export QT_QPA_PLATFORM=xcb
-    xvfb-run -a -s "-screen 0 1280x720x24 +extension RANDR" ./zoom_bot "${BOT_ARGS[@]}" "$@"
+    QT_QPA_PLATFORM=xcb xvfb-run -a -s "-screen 0 1280x720x24 +extension RANDR" "$@"
   else
-    export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
-    ./zoom_bot "${BOT_ARGS[@]}" "$@"
+    QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}" "$@"
   fi
 }
 
-start_bot "$@" &
-BOT_PID=$!
+# ---------- Supervisor ----------
+: "${COREDUMP:=0}"; [[ "$COREDUMP" = "1" ]] && ulimit -c unlimited || ulimit -c 0
+: "${SUPERVISE:=1}"
 
-# ---------- Wait for idle controller on :7600 ----------
-IDLE_TCP_HOST="${IDLE_TCP_HOST:-127.0.0.1}"
-IDLE_TCP_PORT="${IDLE_TCP_PORT:-7600}"
-echo "[diag] waiting for idle controller at ${IDLE_TCP_HOST}:${IDLE_TCP_PORT}"
-for i in $(seq 1 30); do
-  if command -v nc >/dev/null 2>&1; then
-    nc -z "$IDLE_TCP_HOST" "$IDLE_TCP_PORT" >/dev/null 2>&1 && { echo "[diag] idle controller up"; break; }
-  else
-    # bash /dev/tcp works because we run under bash
-    (echo > /dev/tcp/"$IDLE_TCP_HOST"/"$IDLE_TCP_PORT") >/dev/null 2>&1 && { echo "[diag] idle controller up"; break; }
-  fi
-  echo "[diag] waiting (try $i/30)"; sleep 1
-done
+term_all() {
+  echo "[supervisor] TERM received"
+  kill -TERM 0 2>/dev/null || true
+  wait || true
+  exit 0
+}
+trap term_all INT TERM
 
-# ---------- Start HTTP gateway AFTER controller is up ----------
-if [[ "${HTTP_CONTROL_ENABLED:-1}" == "1" ]]; then
-  HTTP_CONTROL_PORT="${HTTP_CONTROL_PORT:-7601}"
-  echo "[entrypoint] starting HTTP control gateway on :$HTTP_CONTROL_PORT -> ${IDLE_TCP_HOST}:${IDLE_TCP_PORT}"
-  "$NODE_BIN" /app/ZoomBot/http_control_gateway.js &
+if [[ "$SUPERVISE" = "0" ]]; then
+  echo "[supervisor] one-shot mode (SUPERVISE=0)"
+  start_http_gateway_once
+QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}" "$BUILD_DIR/zoom_bot" "${BOT_ARGS[@]}" "${PASS_ARGS[@]}" || true
+  echo "[supervisor] bot exited; stopping bridge and exiting…"
+  kill "$ASR_PID" 2>/dev/null || true
+  wait || true
+  exit 0
 fi
 
-# ---------- Keep container alive with bot ----------
-wait "$BOT_PID"
+RESTART_BACKOFF="${RESTART_BACKOFF:-2}"
+MAX_BACKOFF="${MAX_BACKOFF:-30}"
+
+while true; do
+  echo "[supervisor] starting bot cycle"
+  set +e
+  start_http_gateway_once
+QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}" "$BUILD_DIR/zoom_bot" "${BOT_ARGS[@]}" "${PASS_ARGS[@]}" &
+  BOT_PID=$!
+  set -e
+
+  rc=0
+  wait "$BOT_PID" || rc=$?
+  echo "[supervisor] zoom_bot exited with $rc. Restarting in ${RESTART_BACKOFF}s…"
+  sleep "${RESTART_BACKOFF}"
+  RESTART_BACKOFF=$(( RESTART_BACKOFF < MAX_BACKOFF ? RESTART_BACKOFF * 2 : MAX_BACKOFF ))
+done

@@ -61,7 +61,7 @@ static std::atomic<bool> g_roster_refresh_running{false};
 
 static std::unordered_map<unsigned int, std::string> g_uid_to_name;
 
-static int g_pcm_sock = -1;
+static std::atomic<int> g_pcm_sock{-1};
 
 static std::atomic<bool> g_sdkReady{false};
 static std::atomic<bool> g_inMeeting{false};
@@ -245,6 +245,61 @@ static void control_listener_thread()
     }
 }
 
+static bool try_connect_pcm_now()
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0)
+    {
+        perror("socket");
+        return false;
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(7000); // BOT_PCM_PORT
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+    if (connect(s, (sockaddr *)&addr, sizeof(addr)) != 0)
+    {
+        perror("connect 127.0.0.1:7000");
+        close(s);
+        return false;
+    }
+    int old = g_pcm_sock.exchange(s);
+    if (old != -1)
+        close(old);
+    info("PCM socket connected to 127.0.0.1:7000");
+    return true;
+}
+
+static void ensure_pcm_socket_throttled()
+{
+    if (g_pcm_sock.load() != -1)
+        return;
+    using clock = std::chrono::steady_clock;
+    static std::atomic<clock::time_point> next_retry{clock::now()};
+
+    auto now = clock::now();
+    auto due = next_retry.load();
+    if (now < due)
+        return;
+
+    if (!try_connect_pcm_now())
+    {
+        next_retry.store(now + std::chrono::milliseconds(500));
+    }
+    else
+    {
+        next_retry.store(now);
+    }
+}
+
+static void close_pcm_socket()
+{
+    int s = g_pcm_sock.exchange(-1);
+    if (s != -1)
+        close(s);
+}
+
 class WavWriter
 {
 public:
@@ -412,21 +467,24 @@ public:
         if (!data)
             return;
 
-        open_pcm_socket_once();
-        if (g_pcm_sock != -1)
+        // Reconnect if needed (throttled)
+        ensure_pcm_socket_throttled();
+
+        int s = g_pcm_sock.load();
+        if (s != -1)
         {
-            send(g_pcm_sock, data->GetBuffer(), data->GetBufferLen(), MSG_NOSIGNAL);
+            ssize_t w = send(s, data->GetBuffer(), data->GetBufferLen(), MSG_NOSIGNAL);
+            if (w <= 0)
+            {
+                error("PCM send failed; will reconnect");
+                close_pcm_socket(); // next call will re-open
+            }
         }
 
         if (g_wav)
             g_wav->write(data->GetBuffer(), data->GetBufferLen());
 
         auto count = ++g_mixedFrames;
-        // if ((count % 50) == 0 && !g_quiet)
-        // {
-        //     std::cout << "[audio] mixed frames received: " << count
-        //               << " (last chunk bytes=" << data->GetBufferLen() << ")\n";
-        // }
     }
 
     void onOneWayAudioRawDataReceived(AudioRawData *, uint32_t) override {}
@@ -628,15 +686,6 @@ struct MyRecordingCtrlEvent : public IMeetingRecordingCtrlEvent
 #endif
 };
 static std::unique_ptr<MyRecordingCtrlEvent> g_recordEvt;
-
-static void close_pcm_socket()
-{
-    if (g_pcm_sock != -1)
-    {
-        close(g_pcm_sock);
-        g_pcm_sock = -1;
-    }
-}
 
 class MyMeetingEventHandler : public IMeetingServiceEvent
 {
