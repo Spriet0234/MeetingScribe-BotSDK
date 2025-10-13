@@ -10,7 +10,6 @@
 #include <atomic>
 #include <vector>
 
-// Zoom SDK
 #include "zoom_sdk.h"
 #include "auth_service_interface.h"
 #include "meeting_service_interface.h"
@@ -18,12 +17,10 @@
 #include "meeting_service_components/meeting_audio_interface.h"
 #include "meeting_service_components/meeting_participants_ctrl_interface.h"
 
-// Raw data
 #include "rawdata/zoom_rawdata_api.h"
 #include "rawdata/rawdata_audio_helper_interface.h"
 #include "zoom_sdk_raw_data_def.h"
 
-// socket
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -36,7 +33,6 @@
 using namespace ZOOMSDK;
 using json = nlohmann::json;
 
-// ─── Globals ─────────────────────────────────────────────────────────────────────
 std::mutex auth_mutex;
 std::condition_variable auth_cv;
 bool auth_done = false;
@@ -139,7 +135,6 @@ static void control_listener_thread()
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(7600);
-    // bind to all interfaces so host -> -p 7600:7600 always reaches us
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
     if (bind(srv, (sockaddr *)&addr, sizeof(addr)) != 0)
@@ -388,7 +383,7 @@ static void open_pcm_socket_once()
     g_pcm_sock = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(7000); // BOT_PCM_PORT
+    addr.sin_port = htons(7000);
     inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
     if (connect(g_pcm_sock, (sockaddr *)&addr, sizeof(addr)) != 0)
     {
@@ -467,7 +462,6 @@ public:
         if (!data)
             return;
 
-        // Reconnect if needed (throttled)
         ensure_pcm_socket_throttled();
 
         int s = g_pcm_sock.load();
@@ -477,7 +471,7 @@ public:
             if (w <= 0)
             {
                 error("PCM send failed; will reconnect");
-                close_pcm_socket(); // next call will re-open
+                close_pcm_socket();
             }
         }
 
@@ -527,10 +521,8 @@ public:
         }
         info("Active audio: " + uids);
 
-        // Send to Node on UDP 7100 as: active=uid,uid,uid
         send_udp_line(7100, std::string("active=") + uids);
 
-        // Keep the name map fresh
         emit_roster_names(meetingService);
     }
 
@@ -541,7 +533,7 @@ public:
 
 static std::unique_ptr<MyAudioCtrlEvent> g_audioCtrlEvent;
 
-// ─── JWT helper ──────────────────────────────────────────────────────────────────
+// JWT helper
 static size_t WriteCallback(void *c, size_t s, size_t n, void *u)
 {
     auto *str = static_cast<std::string *>(u);
@@ -889,7 +881,7 @@ private:
 
 static MyMeetingEventHandler meetingHandler;
 
-// ─── Join helper ─────────────────────────────────────────────────────────────────
+// Join Helper
 void joinMeeting(const std::string &meetingId, const std::string &userName,
                  const std::string &passcode = "", const std::string &zakToken = "")
 {
@@ -934,17 +926,17 @@ public:
             g_sdkReady = true;
             if (!g_idleMode.load() && !g_meetingId.empty())
             {
-                std::cout << "✅ Auth success – joining " << g_meetingId << std::endl;
+                std::cout << "Auth success – joining " << g_meetingId << std::endl;
                 joinMeeting(g_meetingId, "MyBot", passcodeGlobal, zakGlobal);
             }
             else
             {
-                info("✅ Auth success – idle mode active, waiting for meeting credentials");
+                info("Auth success – idle mode active, waiting for meeting credentials");
             }
         }
         else
         {
-            std::cerr << "❌ Auth failed: " << result << std::endl;
+            std::cerr << "Auth failed: " << result << std::endl;
             if (authLoop)
                 g_main_loop_quit(authLoop);
         }
@@ -975,15 +967,11 @@ int main(int argc, char *argv[])
             want_help = true;
             continue;
         }
-        // positional collection stays for non-idle mode
         if (a.size())
         {
-            // keep original behavior
-            // note: we will parse positionals after flag scan
         }
     }
 
-    // rebuild positional (to preserve your original parsing)
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i)
     {
@@ -1000,7 +988,6 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    // In non-idle mode we still require a meeting id (keep your current UX)
     if (!g_idleMode.load())
     {
         if (positional.size() < 1)
@@ -1059,7 +1046,6 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    // If idle mode, spin up control listener + a waiter that joins when a job arrives
     std::thread ctl;
     if (g_idleMode.load())
     {
@@ -1067,7 +1053,6 @@ int main(int argc, char *argv[])
 
         std::thread waiter([]()
                            {
-            // Wait for auth first
             while (!g_sdkReady.load()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
             info("[idle] ready for jobs");
 
@@ -1083,7 +1068,6 @@ int main(int argc, char *argv[])
                 info("[idle] received job – joining " + mid);
                 joinMeeting(mid, "MyBot", pwd, zak);
 
-                // Wait until meeting finishes before accepting another
                 while (g_inMeeting.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 info("[idle] meeting complete – ready for next job");
             } });

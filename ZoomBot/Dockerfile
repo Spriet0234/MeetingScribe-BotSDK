@@ -1,10 +1,8 @@
-# ZoomBot/Dockerfile
 FROM ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG SDK_DIR_NAME=zoom-meeting-sdk-linux_x86_64-6.5.5.3543
 
-# Core build/runtime deps
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -26,7 +24,6 @@ RUN set -eux; \
     netcat-openbsd; \
     rm -rf /var/lib/apt/lists/*
 
-# Install Node 18 from NodeSource (modern enough for AWS SDK v3)
 RUN set -eux; \
     ARCH="$(dpkg --print-architecture)"; \
     curl -fsSL https://deb.nodesource.com/setup_18.x | bash -; \
@@ -35,20 +32,16 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     ln -sf /usr/bin/node /usr/local/bin/node
 
-# Single-header nlohmann/json
 RUN mkdir -p /usr/include/nlohmann \
     && curl -fsSL https://raw.githubusercontent.com/nlohmann/json/v3.11.3/single_include/nlohmann/json.hpp \
     -o /usr/include/nlohmann/json.hpp
 
-# App
 WORKDIR /app/ZoomBot
 COPY . /app/ZoomBot
 
-# Copy Zoom SDK drop-in
 COPY ${SDK_DIR_NAME}/ /app/ZoomBot/${SDK_DIR_NAME}/
 ENV SDK_SYNC=copy
 
-# Zoom client config
 RUN mkdir -p /root/.config \
     && printf "%s\n" "system.audio.type=default" > /root/.config/zoomus.conf
 
@@ -59,17 +52,16 @@ ENV QT_QPA_PLATFORM=offscreen \
 RUN printf "%s\n" "/app/ZoomBot/sdk/lib" "/app/ZoomBot/sdk/qt_libs/Qt/lib" > /etc/ld.so.conf.d/zoombot.conf \
     && ldconfig
 
-# (Optional) debugger
 RUN apt-get update && apt-get install -y --no-install-recommends gdb && rm -rf /var/lib/apt/lists/*
 
-# Entrypoint
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Node deps (install once)
 RUN cd /app/ZoomBot \
     && npm init -y \
-    && npm install --omit=dev ws @aws-sdk/client-s3
+    && npm install ws @aws-sdk/client-s3 @aws-sdk/s3-request-presigner --omit=dev \
+    && ln -sf /usr/bin/nodejs /usr/local/bin/node
+
 
 EXPOSE 7000 7600 7601
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

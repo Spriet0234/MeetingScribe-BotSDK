@@ -58,7 +58,6 @@ const server = http.createServer(async (req, res) => {
         return res.end("bad json");
       }
 
-      // Accept either meeting_id or meetingNumber; normalize to meeting_id
       const meeting_id = j.meeting_id || j.meetingNumber;
       const passcode = j.passcode || "";
       const zak = j.zak || "";
@@ -70,7 +69,7 @@ const server = http.createServer(async (req, res) => {
 
       const line = JSON.stringify({ meeting_id, passcode, zak });
       try {
-        const resp = await forwardToIdle(line); // e.g., "OK queued"
+        const resp = await forwardToIdle(line);
         res.writeHead(200, { "Content-Type": "application/json" });
         return res.end(JSON.stringify({ status: resp }));
       } catch (e) {

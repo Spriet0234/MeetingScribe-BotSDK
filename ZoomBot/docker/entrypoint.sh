@@ -12,7 +12,6 @@ export HOME="${HOME:-/app}"
 mkdir -p "$HOME/.config"
 [[ -f "$HOME/.config/zoomus.conf" ]] || echo "system.audio.type=default" > "$HOME/.config/zoomus.conf"
 
-# ---------- Audio (optional) ----------
 if command -v pulseaudio >/dev/null 2>&1; then
   pulseaudio --check >/dev/null 2>&1 || true
   pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1 || true
@@ -22,7 +21,6 @@ if command -v pulseaudio >/dev/null 2>&1; then
   fi
 fi
 
-# ---------- SDK sync (optional) ----------
 if [[ "${SDK_SYNC:-}" == "copy" || "${SDK_SYNC:-}" == "move" ]]; then
   PKG_DIR=$(ls -d "$SDK_ROOT"/zoom-meeting-sdk-linux_* 2>/dev/null | head -n1 || true)
   [[ -n "$PKG_DIR" && -d "$PKG_DIR" ]] || { echo "SDK_SYNC=$SDK_SYNC set, but no SDK found"; exit 2; }
@@ -36,7 +34,6 @@ if [[ "${SDK_SYNC:-}" == "copy" || "${SDK_SYNC:-}" == "move" ]]; then
   done
 fi
 
-# ---------- Verify SDK ----------
 SDK_INC_DIR=""
 for d in "$SDK_DIR/include" "$SDK_DIR/h"; do
   [[ -f "$d/zoom_sdk.h" ]] && SDK_INC_DIR="$d" && break
@@ -46,7 +43,6 @@ done
 [[ -n "$SDK_INC_DIR" ]] || { echo "Missing headers"; exit 2; }
 [[ -f "$SDK_DIR/lib/libmeetingsdk.so.1" ]] || ln -sf libmeetingsdk.so "$SDK_DIR/lib/libmeetingsdk.so.1"
 
-# ---------- Qt / Loader ----------
 export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
 export LD_LIBRARY_PATH="$SDK_DIR/lib:$SDK_DIR/qt_libs/Qt/lib:${LD_LIBRARY_PATH:-}"
 export QT_PLUGIN_PATH="$SDK_DIR/qt_libs/Qt/plugins"
@@ -63,34 +59,27 @@ cmake --build . -j"$(nproc)"
 NODE_BIN="$(command -v node || command -v nodejs || true)"
 [[ -n "$NODE_BIN" ]] || { echo "ERROR: node not found" >&2; exit 2; }
 
-# Bridge env defaults
-export QUIET="${QUIET:-0}"             # show logs unless explicitly silenced
+export QUIET="${QUIET:-0}"             
 export LOG_LEVEL="${LOG_LEVEL:-info}"
 export BOT_PCM_HOST="${BOT_PCM_HOST:-127.0.0.1}"
 export BOT_PCM_PORT="${BOT_PCM_PORT:-7000}"
 export ASR_PROVIDER="${ASR_PROVIDER:-deepgram}"
-# Expect DEEPGRAM_API_KEY / ASSEMBLYAI_API_KEY if those providers are used
-# Optional S3: AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET, S3_PREFIX, S3_FORMAT, S3_FLUSH_SECS, MEETING_ID
 
-# Extra diagnostics
 echo "[entrypoint] node=$($NODE_BIN -v 2>/dev/null || echo missing) cwd=$(pwd)"
 echo "[entrypoint] ls /app/ZoomBot:"
 ls -al /app/ZoomBot || true
 echo "[entrypoint] ls node_modules (if present):"
 ls -al /app/ZoomBot/node_modules 2>/dev/null || echo "(no node_modules visible)"
 
-# Run the bridge from the app dir (module resolution is unambiguous)
 cd /app/ZoomBot
 
 echo "[entrypoint] starting ASR bridge (provider=$ASR_PROVIDER, pcm=${BOT_PCM_HOST}:${BOT_PCM_PORT}, bucket=${S3_BUCKET:-unset})"
-# Stream logs to console *and* keep a file copy for postmortem
 set +e
 ("$NODE_BIN" /app/ZoomBot/asr_stream_client.js) |& tee -a /var/log/asr_bridge.out &
 ASR_PID=$!
 set -e
 echo "[entrypoint] ASR bridge pid=$ASR_PID (logs also in /var/log/asr_bridge.out)"
 
-# Wait until the PCM server is actually listening
 wait_for_port() {
   local host="$1" port="$2" max="$3" waited=0
   while ! nc -z "$host" "$port" 2>/dev/null; do
@@ -105,11 +94,10 @@ wait_for_port() {
     fi
   done
 }
-wait_for_port "$BOT_PCM_HOST" "$BOT_PCM_PORT" 40   # 20 seconds max
+wait_for_port "$BOT_PCM_HOST" "$BOT_PCM_PORT" 40 
 echo "[entrypoint] PCM bridge is live at ${BOT_PCM_HOST}:${BOT_PCM_PORT}"
 
-# ---------- Bot args (no idle by default) ----------
-: "${BOT_IDLE:=0}"  # default off; set BOT_IDLE=1 to enable idle mode
+: "${BOT_IDLE:=0}"  
 BOT_ARGS=()
 PASS_ARGS=()
 
@@ -127,7 +115,6 @@ else
   PASS_ARGS=("$@")
 fi
 
-# ---------- HTTP control gateway (optional) ----------
 start_http_gateway_once() {
   [[ "${HTTP_CONTROL_ENABLED:-0}" != "1" ]] && return 0
   if [[ -n "${HTTP_PID:-}" ]] && kill -0 "${HTTP_PID}" 2>/dev/null; then return 0; fi
@@ -137,7 +124,6 @@ start_http_gateway_once() {
   HTTP_PID=$!
 }
 
-# ---------- Helpers ----------
 start_bot_once() {
   if [[ "${USE_XVFB:-}" == "1" ]]; then
     QT_QPA_PLATFORM=xcb xvfb-run -a -s "-screen 0 1280x720x24 +extension RANDR" "$@"
@@ -146,7 +132,7 @@ start_bot_once() {
   fi
 }
 
-# ---------- Supervisor ----------
+# Supervisor
 : "${COREDUMP:=0}"; [[ "$COREDUMP" = "1" ]] && ulimit -c unlimited || ulimit -c 0
 : "${SUPERVISE:=1}"
 
